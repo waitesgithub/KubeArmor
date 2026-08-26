@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package enforcer
 
@@ -27,7 +27,25 @@ func CheckBtfSupport(PathPrefix string, log zap.SugaredLogger) string {
 	return "no"
 }
 
-// DetectEnforcer: detect the enforcer on the node
+// CheckIfApparmorFsPresent checks if BTF is present
+func CheckIfApparmorFsPresent(PathPrefix string, log zap.SugaredLogger) string {
+	path := PathPrefix + "/etc/apparmor.d/tunables"
+	if _, err := os.Stat(filepath.Clean(path)); err == nil {
+		return "yes"
+	}
+	return "no"
+}
+
+// CheckIfSecurityFsPresent checks if Security filesystem is present
+func CheckIfSecurityFsPresent(PathPrefix string, log zap.SugaredLogger) string {
+	path := PathPrefix + "/sys/kernel/security"
+	if _, err := os.Stat(filepath.Clean(path)); err == nil {
+		return "yes"
+	}
+	return "no"
+}
+
+// DetectEnforcer detect the enforcer on the node
 func DetectEnforcer(lsmOrder []string, PathPrefix string, log zap.SugaredLogger) string {
 	supportedLsms := []string{}
 	lsm := []byte{}

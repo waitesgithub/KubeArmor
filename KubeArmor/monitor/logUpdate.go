@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package monitor
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
+	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
@@ -29,7 +31,9 @@ func (mon *SystemMonitor) UpdateContainerInfoByContainerID(log tp.Log) tp.Log {
 		log.NamespaceName = val.NamespaceName
 		log.Owner = &val.Owner
 		log.PodName = val.EndPointName
-		log.Labels = val.Labels
+		mon.PodLabelsMapLock.RLock()
+		log.Labels = mon.PodLabelsMap[val.EndPointName]
+		mon.PodLabelsMapLock.RUnlock()
 
 		// update container info
 		log.ContainerName = val.ContainerName
@@ -49,7 +53,7 @@ func (mon *SystemMonitor) UpdateContainerInfoByContainerID(log tp.Log) tp.Log {
 }
 
 // BuildLogBase Function
-func (mon *SystemMonitor) BuildLogBase(eventID int32, msg ContextCombined) tp.Log {
+func (mon *SystemMonitor) BuildLogBase(eventID int32, msg ContextCombined, readlink bool) tp.Log {
 	log := tp.Log{}
 
 	timestamp, updatedTime := kl.GetDateTimeNow()
@@ -62,57 +66,61 @@ func (mon *SystemMonitor) BuildLogBase(eventID int32, msg ContextCombined) tp.Lo
 		log = mon.UpdateContainerInfoByContainerID(log)
 	} else {
 		// update host policy flag
+		nodeLock := *mon.NodeLock
+		nodeLock.RLock()
 		log.PolicyEnabled = mon.Node.PolicyEnabled
-
 		// update host visibility flags
 		log.ProcessVisibilityEnabled = mon.Node.ProcessVisibilityEnabled
 		log.FileVisibilityEnabled = mon.Node.FileVisibilityEnabled
 		log.NetworkVisibilityEnabled = mon.Node.NetworkVisibilityEnabled
 		log.CapabilitiesVisibilityEnabled = mon.Node.CapabilitiesVisibilityEnabled
+		nodeLock.RUnlock()
 	}
 
-	log.HostPPID = int32(msg.ContextSys.HostPPID)
-	log.HostPID = int32(msg.ContextSys.HostPID)
+	if eventID != int32(DropAlert) {
+		log.HostPPID = int32(msg.ContextSys.HostPPID)
+		log.HostPID = int32(msg.ContextSys.HostPID)
 
-	log.PPID = int32(msg.ContextSys.PPID)
-	log.PID = int32(msg.ContextSys.PID)
-	log.UID = int32(msg.ContextSys.UID)
+		log.PPID = int32(msg.ContextSys.PPID)
+		log.PID = int32(msg.ContextSys.PID)
+		log.UID = int32(msg.ContextSys.UID)
 
-	if msg.ContextSys.EventID == SysExecve || msg.ContextSys.EventID == SysExecveAt {
-		log.Source = mon.GetParentExecPath(msg.ContainerID, msg.ContextSys.HostPID, false)
-	} else {
-		log.Source = mon.GetCommand(msg.ContainerID, msg.ContextSys.HostPID, false)
+		log.ProcessName = mon.GetExecPath(msg.ContainerID, msg.ContextSys, readlink)
+		log.ParentProcessName = mon.GetParentExecPath(msg.ContainerID, msg.ContextSys, readlink, false)
+
+		if msg.ContextSys.EventID == SysExecve || msg.ContextSys.EventID == SysExecveAt {
+			log.Source = mon.GetParentExecPath(msg.ContainerID, msg.ContextSys, readlink, false)
+		} else {
+			log.Source = mon.GetCommand(msg.ContainerID, msg.ContextSys, readlink)
+		}
+
+		log.Cwd = strings.TrimRight(string(msg.ContextSys.Cwd[:]), "\x00") + "/"
+		log.TTY = strings.TrimRight(string(msg.ContextSys.TTY[:]), "\x00")
+		log.OID = int32(msg.ContextSys.OID)
+
+		// update ima hashes
+		updateHashData(&log, msg.HashData)
 	}
-
-	log.Cwd = strings.TrimRight(string(msg.ContextSys.Cwd[:]), "\x00") + "/"
-	log.OID = int32(msg.ContextSys.OID)
-
-	log.ParentProcessName = mon.GetExecPath(msg.ContainerID, msg.ContextSys.HostPPID, false)
-	log.ProcessName = mon.GetExecPath(msg.ContainerID, msg.ContextSys.HostPID, false)
 
 	return log
 }
 
 // UpdateLogBase Function (SYS_EXECVE, SYS_EXECVEAT)
-func (mon *SystemMonitor) UpdateLogBase(eventID int32, log tp.Log) tp.Log {
+func (mon *SystemMonitor) UpdateLogBase(ctx SyscallContext, log tp.Log) tp.Log {
 
 	// update the process paths, since we would have received actual exec paths from bprm hook
 	// in case bprm hook has not populated the map with full path, we will fallback to reading from procfs
 	// else we will send out relative path
 
-	parentProcessName := mon.GetParentExecPath(log.ContainerID, uint32(log.HostPID), true)
-	if parentProcessName != "" {
-		log.ParentProcessName = parentProcessName
-	}
-
-	processName := mon.GetExecPath(log.ContainerID, uint32(log.HostPID), true)
+	processName := mon.GetExecPath(log.ContainerID, ctx, true)
 	if processName != "" {
 		log.ProcessName = processName
 	}
 
-	source := mon.GetExecPath(log.ContainerID, uint32(log.HostPPID), true)
-	if source != "" {
-		log.Source = source
+	parentProcessName := mon.GetParentExecPath(log.ContainerID, ctx, true, false)
+	if parentProcessName != "" {
+		log.ParentProcessName = parentProcessName
+		log.Source = parentProcessName
 	}
 
 	return log
@@ -131,7 +139,7 @@ func (mon *SystemMonitor) UpdateLogs() {
 			}
 
 			// generate a log
-			log := mon.BuildLogBase(msg.ContextSys.EventID, msg)
+			log := mon.BuildLogBase(msg.ContextSys.EventID, msg, true)
 
 			switch msg.ContextSys.EventID {
 			case SysOpen:
@@ -513,8 +521,59 @@ func (mon *SystemMonitor) UpdateLogs() {
 				log.Resource = ""
 				log.Data = "syscall=" + GetSyscallName(int32(msg.ContextSys.EventID)) + " fd=" + fd
 
+			case UDPSendMsg, UDPSendSkb:
+				if len(msg.ContextArgs) != 3 {
+					continue
+				}
+				domains := ""
+				if val, ok := msg.ContextArgs[1].(string); ok {
+					domains = val
+				}
+				var sockAddr map[string]string
+				if val, ok := msg.ContextArgs[0].(map[string]string); ok {
+					sockAddr = val
+				}
+				qtype := ""
+				if val, ok := msg.ContextArgs[2].(uint16); ok {
+					if val == 1 {
+						qtype = "A"
+					}
+					if val == 28 {
+						qtype = "AAAA"
+					}
+				}
+				kfunc := "kfunc=UDP_SENDSKB"
+				// UDPSendMsg is disabled.
+				if msg.ContextSys.EventID == UDPSendMsg {
+					kfunc = "kfunc=UDP_SENDMSG"
+
+				}
+				log.Data = kfunc + " domain=" + domains[:len(domains)-1] + // removed trailing . from domain name
+					" daddr=" + sockAddr["sin_addr"] +
+					" qtype=" + qtype
+				log.Operation = "Network"
+				log.Resource = "sa_family=" + sockAddr["sa_family"] + " sin_port=53"
+
+			case DropAlert: // throttling alert
+				log.Operation = "AlertThreshold"
+				log.Type = "SystemEvent"
+				log.MaxAlertsPerSec = cfg.GlobalCfg.MaxAlertPerSec
+				log.DroppingAlertsInterval = cfg.GlobalCfg.ThrottleSec
+
 			default:
 				continue
+			}
+
+			if mon.isProcessInformationMissing(&log) {
+				continue
+			}
+
+			// fallback logic: in case we get relative path in log.Resource for file and process event
+			// then we join cwd + resource to get pull path
+			if log.Operation == "Process" || log.Operation == "File" {
+				if !strings.HasPrefix(strings.Split(log.Resource, " ")[0], "/") && log.Cwd != "/" {
+					log.Resource = filepath.Join(log.Cwd, log.Resource)
+				}
 			}
 
 			// get error message
@@ -529,6 +588,12 @@ func (mon *SystemMonitor) UpdateLogs() {
 				log.Result = "Passed"
 			}
 
+			// exec event
+			log.ExecEvent.ExecID = strconv.FormatUint(msg.ContextSys.ExecID, 10)
+			if comm := strings.TrimRight(string(msg.ContextSys.Comm[:]), "\x00"); len(comm) > 0 {
+				log.ExecEvent.ExecutableName = comm
+			}
+
 			// push the generated log
 			if mon.Logger != nil {
 				go mon.Logger.PushLog(log)
@@ -538,6 +603,44 @@ func (mon *SystemMonitor) UpdateLogs() {
 					go mon.Logger.PushLog(log)
 				}
 			}
+		}
+	}
+}
+
+func (mon *SystemMonitor) isProcessInformationMissing(log *tp.Log) bool {
+	if log.ProcessName == "" {
+		switch log.Operation {
+		case "Process":
+			if log.Resource != "" {
+				if res := strings.Split(log.Resource, " "); len(res) > 0 {
+					log.ProcessName = res[0]
+				}
+			} else {
+				mon.Logger.Debug("Process Event with empty processName and Resource")
+				return true
+			}
+		case "Network", "File":
+			if log.Source != "" {
+				if src := strings.Split(log.Source, " "); len(src) > 0 {
+					log.ProcessName = src[0]
+				}
+			} else {
+				mon.Logger.Debugf("%s Event with empty processName and Source", log.Operation)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func updateHashData(log *tp.Log, hash HashContext) {
+	log.ParentHash = hash.ParentHash
+	log.ProcessHash = hash.ProcessHash
+	log.ResourceHash = hash.ResourceHash
+
+	if log.ParentHash != "" || log.ProcessHash != "" || log.ResourceHash != "" {
+		if hash.HashAlgo == 1 {
+			log.HashAlgo = "sha256"
 		}
 	}
 }

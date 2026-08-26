@@ -5,27 +5,78 @@ environment:
   # The target environment to install KubeArmor in. Possible values: generic, GKE, EKS, BottleRocket, k0s, k3s, minikube, microk8s
   name: generic
 
+# Optional: override the GKE Autopilot matching-allowlist version. If empty, defaults to chart.majorMinorVersion.
+gkeAllowlistVersion: ""
+
+tls:
+  enabled: false  
+
 kubearmorRelay:
   # to enable/disable kubearmor-relay
   enabled: true
   image:
     # kubearmor-init image repo
-    repository: kubearmor/kubearmor-relay-server
+    repository: docker.io/kubearmor/kubearmor-relay-server
     # kubearmor-init image tag
     tag: latest
+    # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+    imagePullSecrets: ""
   # kubearmor-init imagePullPolicy
   imagePullPolicy: Always
+  tolerations: ""
+
   # Add environment variables for STDOUT logging
   enableStdoutLogs: "false"
   enableStdoutAlerts: "false"
   enableStdoutMsg: "false"
 
+  # Set resource limits — KubeArmor’s memory usage tends to grow significantly over time.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+  tls:
+    extraDnsNames: ["localhost"]
+    extraIpAddresses: ["127.0.0.1"]
+    tlsCertPath: /var/lib/kubearmor/tls
+    tlsCertProvider: external
+    certSecretName: kubearmor-relay-server-certs
+    certVolumeMount:
+    - mountPath: /var/lib/kubearmor/tls
+      name: kubearmor-relay-certs-secrets
+      readOnly: true
+    certVolume:
+    - name: kubearmor-relay-certs-secrets
+      projected:
+        defaultMode: 0444
+        sources:
+        - secret:
+            name: kubearmor-relay-server-certs
+            items:
+            - key: tls.crt
+              path: server.crt
+            - key: tls.key
+              path: server.key
+            - key: ca.crt
+              path: ca.crt
+        - secret:
+            name: kubearmor-client-certs
+            items:
+            - key: tls.crt
+              path: client.crt
+            - key: tls.key
+              path: client.key  
+
+
 kubearmorInit:
   image:
     # kubearmor-init image repo
-    repository: kubearmor/kubearmor-init
+    repository: docker.io/kubearmor/kubearmor-init
     # kubearmor-init image tag
     tag: stable
+    # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+    imagePullSecrets: ""
   # kubearmor-init imagePullPolicy
   imagePullPolicy: Always
 
@@ -34,7 +85,9 @@ kubeRbacProxy:
     # kube-rbac-proxy image repo
     repository: gcr.io/kubebuilder/kube-rbac-proxy
     # kube-rbac-proxy image tag
-    tag: v0.12.0
+    tag: v0.15.0
+    # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+    imagePullSecrets: ""
   # kube-rbac-proxy imagePullPolicy
   imagePullPolicy: Always
 
@@ -44,34 +97,71 @@ kubearmorController:
   replicas: 1
   image:
     # kubearmor-controller image repo
-    repository: kubearmor/kubearmor-controller
+    repository: docker.io/kubearmor/kubearmor-controller
     # kubearmor-controller image tag
     tag: latest
+    # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+    imagePullSecrets: ""
+  tolerations: ""  
   mutation:
     # kubearmor-controller failure policy
     failurePolicy: Ignore
   # kubearmor-controller imagePullPolicy
   imagePullPolicy: Always
+  # Set resource limits — KubeArmor’s memory usage tends to grow significantly over time.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
 
 kubearmorConfigMap:
   defaultFilePosture: audit
   defaultCapabilitiesPosture: audit
   defaultNetworkPosture: audit
   visibility: process,network
+  alertThrottling: true
+  maxAlertPerSec: 10
+  throttleSec: 30
+  matchArgs: true
 
 #volume mounts and volumes
 kubearmor:
+  # https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
+  tolerations: ""
   image:
     # kubearmor daemonset image repo
-    repository: kubearmor/kubearmor
+    repository: docker.io/kubearmor/kubearmor
     # kubearmor daemonset image tag
     tag: stable
-
+    # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+    imagePullSecrets: ""
   # kubearmor daemonset imagePullPolicy
   imagePullPolicy: Always
 
   # kubearmor daemonset arguments. See `kubearmor --help`
   args: []
+
+  tls:
+    tlsCertPath: /var/lib/kubearmor/tls
+    tlsCertProvider: self
+    caSecretName: kubearmor-ca
+    clientCertSecretName: kubearmor-client-certs
+    kubearmorCACertVolumeMount:
+    - mountPath: /var/lib/kubearmor/tls
+      name: kubearmor-ca-secret
+      readOnly: true
+    kubearmorCACertVolume:
+    - name: kubearmor-ca-secret
+      projected:
+        defaultMode: 0444
+        sources:
+        - secret:
+            name: kubearmor-ca
+            items:
+            - key: tls.crt
+              path: ca.crt
+            - key: tls.key
+              path: ca.key
 
   capabilities:
     add:
@@ -81,6 +171,7 @@ kubearmor:
     - SYS_ADMIN
     - SYS_PTRACE
     - MAC_ADMIN
+    - NET_ADMIN
     - SYS_RESOURCE
     - IPC_LOCK
     - CAP_DAC_OVERRIDE
@@ -96,14 +187,57 @@ kubearmor:
   - emptyDir: {}
     name: bpf
 
+  autoPilot:
+    volumeMounts:
+    - mountPath: /run/containerd/containerd.sock
+      name: containerd-socket
+      readOnly: true
+    - mountPath: /sys/kernel/debug
+      name: sys-kernel-debug-path
+    - mountPath: /host/procfs
+      name: proc-fs-mount
+      readOnly: true
+    - mountPath: /opt/kubearmor/karmor.yaml
+      name: kubearmor-config
+      subPath: karmor.yaml
+    initMounts:
+      - mountPath: /sys/kernel/debug
+        name: sys-kernel-debug-path
+      - mountPath: /host/procfs
+        name: proc-fs-mount
+        readOnly: true
+      - mountPath: /opt/kubearmor/karmor.yaml
+        name: kubearmor-config
+        subPath: karmor.yaml
+      - mountPath: /opt/kubearmor/BPF
+        name: bpf
+    volumes:
+      - hostPath:
+          path: /run/containerd/containerd.sock
+          type: Socket
+        name: containerd-socket
+      - hostPath:
+          path: /sys/kernel/debug
+          type: Directory
+        name: sys-kernel-debug-path
+      - hostPath:
+          path: /proc
+          type: Directory
+        name: proc-fs-mount
+      - configMap:
+          defaultMode: 420
+          items:
+          - key: karmor.yaml
+            path: karmor.yaml
+          name: kubearmor-config
+        name: kubearmor-config
+
   initMounts:
   - mountPath: /opt/kubearmor/BPF
     name: bpf
   - mountPath: /lib/modules
     name: lib-modules-path
     readOnly: true
-  - mountPath: /sys/fs/bpf
-    name: sys-fs-bpf-path
   - mountPath: /sys/kernel/security
     name: sys-kernel-security-path
   - mountPath: /sys/kernel/debug
@@ -122,8 +256,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -144,8 +276,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -166,8 +296,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -188,8 +316,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -210,8 +336,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -232,8 +356,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -243,7 +365,7 @@ kubearmor:
       readOnly: true
     - mountPath: /etc/apparmor.d
       name: etc-apparmor-d-path
-    - mountPath: /var/run/containerd/containerd.sock
+    - mountPath: /run/k3s/containerd/containerd.sock
       name: containerd-sock-path
       readOnly: true
 
@@ -254,8 +376,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -272,8 +392,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -294,8 +412,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -316,8 +432,6 @@ kubearmor:
     - mountPath: /lib/modules
       name: lib-modules-path
       readOnly: true
-    - mountPath: /sys/fs/bpf
-      name: sys-fs-bpf-path
     - mountPath: /sys/kernel/security
       name: sys-kernel-security-path
     - mountPath: /sys/kernel/debug
@@ -343,10 +457,6 @@ kubearmor:
         path: /lib/modules
         type: DirectoryOrCreate
       name: lib-modules-path
-    - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
     - hostPath:
         path: /sys/kernel/security
         type: Directory
@@ -378,10 +488,6 @@ kubearmor:
         type: DirectoryOrCreate
       name: lib-modules-path
     - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
-    - hostPath:
         path: /sys/kernel/security
         type: Directory
       name: sys-kernel-security-path
@@ -411,10 +517,6 @@ kubearmor:
         path: /lib/modules
         type: DirectoryOrCreate
       name: lib-modules-path
-    - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
     - hostPath:
         path: /sys/kernel/security
         type: Directory
@@ -446,10 +548,6 @@ kubearmor:
         type: DirectoryOrCreate
       name: lib-modules-path
     - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
-    - hostPath:
         path: /sys/kernel/security
         type: Directory
       name: sys-kernel-security-path
@@ -479,10 +577,6 @@ kubearmor:
         path: /lib/modules
         type: DirectoryOrCreate
       name: lib-modules-path
-    - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
     - hostPath:
         path: /sys/kernel/security
         type: Directory
@@ -514,10 +608,6 @@ kubearmor:
         type: Directory
       name: lib-modules-path
     - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
-    - hostPath:
         path: /sys/kernel/security
         type: Directory
       name: sys-kernel-security-path
@@ -547,10 +637,6 @@ kubearmor:
         path: /lib/modules
         type: DirectoryOrCreate
       name: lib-modules-path
-    - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
     - hostPath:
         path: /sys/kernel/security
         type: Directory
@@ -582,10 +668,6 @@ kubearmor:
         type: DirectoryOrCreate
       name: lib-modules-path
     - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
-    - hostPath:
         path: /sys/kernel/security
         type: Directory
       name: sys-kernel-security-path
@@ -611,10 +693,6 @@ kubearmor:
         path: /lib/modules
         type: DirectoryOrCreate
       name: lib-modules-path
-    - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
     - hostPath:
         path: /sys/kernel/security
         type: Directory
@@ -646,10 +724,6 @@ kubearmor:
         type: DirectoryOrCreate
       name: lib-modules-path
     - hostPath:
-        path: /sys/fs/bpf
-        type: Directory
-      name: sys-fs-bpf-path
-    - hostPath:
         path: /sys/kernel/security
         type: Directory
       name: sys-kernel-security-path
@@ -673,3 +747,9 @@ kubearmor:
         path: /var/run/containerd/containerd.sock
         type: Socket
       name: containerd-sock-path
+
+  # Set DaemonSet resource limits — KubeArmor’s memory usage tends to grow significantly over time.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi

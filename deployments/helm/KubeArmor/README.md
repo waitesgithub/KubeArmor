@@ -24,26 +24,31 @@ helm upgrade --install kubearmor . -n kubearmor --create-namespace
 | kubearmor.configMap.defaultNetworkPosture | string | audit | Default network posture for KubeArmor |
 | kubearmor.configMap.defaultCapabilitiesPosture | string | audit | Default capabilities posture for KubeArmor |
 | kubearmor.configMap.visibility | string | audit | Default visibility for KubeArmor |
+| kubearmor.resources | object | { requests: { cpu: 10m, memory: 64Mi } } | kubearmor DaemonSet container resources requests/limits |
 | kubearmorRelay.enable | bool | true | to enable/disable kubearmor-relay |
 | kubearmorRelay.image.repository | string | kubearmor/kubearmor-relay | kubearmor-relay image repo |
 | kubearmorRelay.image.tag | string | latest | kubearmor-relay image tag |
 | kubearmorRelay.imagePullPolicy | string | Always | kubearmor-relay imagePullPolicy |
+| kubearmorRelay.resources | object | { requests: { cpu: 10m, memory: 64Mi } } | kubearmor-relay container resources requests/limits |
 | kubearmorInit.image.repository | string | kubearmor/kubearmor-init | kubearmor-init image repo |
 | kubearmorInit.image.tag | string | stable | kubearmor-init image tag |
 | kubearmorInit.imagePullPolicy | string | Always | kubearmor-init imagePullPolicy |
 | kubeRbacProxy.image.repository | string | gcr.io/kubebuilder/kube-rbac-proxy | kube-rbac-proxy image repo |
-| kubeRbacProxy.image.tag | string | v0.12.0 | kube-rbac-proxy image tag |
+| kubeRbacProxy.image.tag | string | v0.15.0 | kube-rbac-proxy image tag |
 | kubeRbacProxy.imagePullPolicy | string | Always | kube-rbac-proxy imagePullPolicy |
 | kubearmorController.replicas | int | 1 | kubearmor-controller replicas |
 | kubearmorController.image.repository | string | kubearmor/kubearmor-controller | kubearmor-controller image repo |
 | kubearmorController.image.tag | string | latest | kubearmor-controller image tag |
 | kubearmorController.mutation.failurePolicy | string | Ignore | kubearmor-controller failure policy |
 | kubearmorController.imagePullPolicy | string | Always | kubearmor-controller imagePullPolicy |
+| kubearmorController.resources | object | { requests: { cpu: 10m, memory: 64Mi } } | kubearmor-controller container resources requests/limits |
 
 ## kubearmor-args
 ```
 $ sudo ./kubearmor -h
 Usage of ./kubearmor:
+  -alertThrottling
+        enabling Alert Throttling
   -bpfFsPath string
         Path to the BPF filesystem to use for storing maps (default "/sys/fs/bpf")
   -cluster string
@@ -84,8 +89,12 @@ Usage of ./kubearmor:
         log file path, {path|stdout|none} (default "none")
   -lsm string
         lsm preference order to use, available lsms [bpf, apparmor, selinux] (default "bpf,apparmor,selinux")
+  -maxAlertPerSec int
+        Maximum alerts allowed per second (default 10)
   -seLinuxProfileDir string
         SELinux profile directory (default "/tmp/kubearmor.selinux")
+  -throttleSec int
+        Time period for which subsequent alerts will be dropped (in sec) (default 30)
   -visibility string
         Container Visibility to use, available visibility [process,file,network,capabilities,none] (default "process,network")
 ```

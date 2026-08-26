@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package v1
 
@@ -7,8 +7,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type MatchExpressionsType struct {
+	// +kubebuilder:validation:Enum=label
+	Key string `json:"key,omitempty"`
+
+	// +kubebuilder:validation:Enum=In;NotIn
+	Operator string `json:"operator,omitempty"`
+
+	Values []string `json:"values,omitempty"`
+}
+
 type SelectorType struct {
-	MatchLabels map[string]string `json:"matchLabels,omitempty"`
+	MatchLabels      map[string]string      `json:"matchLabels,omitempty"`
+	MatchExpressions []MatchExpressionsType `json:"matchExpressions,omitempty"`
 }
 
 type MatchVolumeMountType struct {
@@ -51,6 +62,7 @@ type KubeArmorPolicySpec struct {
 	Network      NetworkType      `json:"network,omitempty"`
 	Capabilities CapabilitiesType `json:"capabilities,omitempty"`
 	Syscalls     SyscallsType     `json:"syscalls,omitempty"`
+	Presets      []PresetType     `json:"presets,omitempty"`
 
 	AppArmor string `json:"apparmor,omitempty"`
 
@@ -75,6 +87,9 @@ type KubeArmorPolicyStatus struct {
 // +genclient
 // +kubebuilder:resource:shortName=ksp
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="Action",type=string,JSONPath=`.spec.action`,priority=10
+// +kubebuilder:printcolumn:name="Selector",type=string,JSONPath=`.spec.selector.matchLabels`,priority=10
 type KubeArmorPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

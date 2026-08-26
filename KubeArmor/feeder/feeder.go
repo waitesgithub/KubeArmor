@@ -1,32 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package feeder is responsible for sanitizing and relaying telemetry and alerts data to connected clients
 package feeder
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
+	"github.com/kubearmor/KubeArmor/KubeArmor/config"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 
 	"github.com/google/uuid"
+	"github.com/kubearmor/KubeArmor/KubeArmor/cert"
 	pb "github.com/kubearmor/KubeArmor/protobuf"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
+
+// parseDataString parses a space-separated key=value string into a map
+func parseDataString(data string) map[string]string {
+	if data == "" {
+		return nil
+	}
+
+	result := make(map[string]string)
+	pairs := strings.Fields(data) // Split by whitespace
+
+	for _, pair := range pairs {
+		if strings.Contains(pair, "=") {
+			parts := strings.SplitN(pair, "=", 2) // Split only on first "="
+			if len(parts) == 2 {
+				key := parts[0]
+				if len(key) > 0 {
+					key = strings.ToUpper(key[:1]) + key[1:]
+				}
+				result[key] = parts[1]
+			}
+		}
+	}
+
+	return result
+}
 
 // ============ //
 // == Global == //
@@ -46,236 +75,157 @@ func init() {
 // == gRPC == //
 // ========== //
 
-// MsgStruct Structure
-type MsgStruct struct {
+// EventStruct Structure
+type EventStruct[T any] struct {
 	Filter    string
-	Broadcast chan *pb.Message
+	Broadcast chan *T
 }
 
-// MsgStructs Map
-var MsgStructs map[string]MsgStruct
+type EventStructs struct {
+	MsgStructs map[string]EventStruct[pb.Message]
+	MsgLock    sync.RWMutex
 
-// MsgLock Lock
-var MsgLock *sync.RWMutex
+	AlertStructs map[string]EventStruct[pb.Alert]
+	AlertLock    sync.RWMutex
 
-// AlertStruct Structure
-type AlertStruct struct {
-	Filter    string
-	Broadcast chan *pb.Alert
+	LogStructs map[string]EventStruct[pb.Log]
+	LogLock    sync.RWMutex
+}
+type cachedUserName struct {
+	Username  string
+	ExpiresAt time.Time
 }
 
-// AlertStructs Map
-var AlertStructs map[string]AlertStruct
-
-// AlertLock Lock
-var AlertLock *sync.RWMutex
-
-// LogStruct Structure
-type LogStruct struct {
-	Filter    string
-	Broadcast chan *pb.Log
+type UserNameMap struct {
+	usernames map[uint32]cachedUserName
+	mu        sync.RWMutex
+	ttl       time.Duration
 }
 
-// LogStructs Map
-var LogStructs map[string]LogStruct
+// AddMsgStruct Function
+func (es *EventStructs) AddMsgStruct(filter string, queueSize int) (string, chan *pb.Message) {
+	es.MsgLock.Lock()
+	defer es.MsgLock.Unlock()
 
-// LogLock Lock
-var LogLock *sync.RWMutex
-
-// LogService Structure
-type LogService struct {
-	//
-}
-
-// HealthCheck Function
-func (ls *LogService) HealthCheck(ctx context.Context, nonce *pb.NonceMessage) (*pb.ReplyMessage, error) {
-	replyMessage := pb.ReplyMessage{Retval: nonce.Nonce}
-	return &replyMessage, nil
-}
-
-// addMsgStruct Function
-func (ls *LogService) addMsgStruct(uid string, conn chan *pb.Message, filter string) {
-	MsgLock.Lock()
-	defer MsgLock.Unlock()
-
-	msgStruct := MsgStruct{}
-	msgStruct.Filter = filter
-	msgStruct.Broadcast = conn
-	MsgStructs[uid] = msgStruct
-
-	kg.Printf("Added a new client (%s) for WatchMessages", uid)
-}
-
-// removeMsgStruct Function
-func (ls *LogService) removeMsgStruct(uid string) {
-	MsgLock.Lock()
-	defer MsgLock.Unlock()
-
-	delete(MsgStructs, uid)
-
-	kg.Printf("Deleted the client (%s) for WatchMessages", uid)
-}
-
-// WatchMessages Function
-func (ls *LogService) WatchMessages(req *pb.RequestMessage, svr pb.LogService_WatchMessagesServer) error {
 	uid := uuid.Must(uuid.NewRandom()).String()
-	conn := make(chan *pb.Message, QueueSize)
-	defer close(conn)
-	ls.addMsgStruct(uid, conn, req.Filter)
-	defer ls.removeMsgStruct(uid)
+	conn := make(chan *pb.Message, queueSize)
 
-	for Running {
-		select {
-		case <-svr.Context().Done():
-			return nil
-		case resp := <-conn:
-			if status, ok := status.FromError(svr.Send(resp)); ok {
-				switch status.Code() {
-				case codes.OK:
-					// noop
-				case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-					kg.Warnf("Failed to send a message=[%+v] err=[%s]", resp, status.Err().Error())
-					return status.Err()
-				default:
-					return nil
-				}
-			}
-		}
+	msgStruct := EventStruct[pb.Message]{
+		Filter:    filter,
+		Broadcast: conn,
 	}
 
-	return nil
+	es.MsgStructs[uid] = msgStruct
+
+	return uid, conn
 }
 
-// addAlertStruct Function
-func (ls *LogService) addAlertStruct(uid string, conn chan *pb.Alert, filter string) {
-	AlertLock.Lock()
-	defer AlertLock.Unlock()
+// RemoveMsgStruct Function
+func (es *EventStructs) RemoveMsgStruct(uid string) {
+	es.MsgLock.Lock()
+	defer es.MsgLock.Unlock()
 
-	alertStruct := AlertStruct{}
-	alertStruct.Filter = filter
-	alertStruct.Broadcast = conn
-	AlertStructs[uid] = alertStruct
+	delete(es.MsgStructs, uid)
+}
 
-	kg.Printf("Added a new client (%s, %s) for WatchAlerts", uid, filter)
+// AddAlertStruct Function
+func (es *EventStructs) AddAlertStruct(filter string, queueSize int) (string, chan *pb.Alert) {
+	es.AlertLock.Lock()
+	defer es.AlertLock.Unlock()
+
+	uid := uuid.Must(uuid.NewRandom()).String()
+	conn := make(chan *pb.Alert, queueSize)
+
+	alertStruct := EventStruct[pb.Alert]{
+		Filter:    filter,
+		Broadcast: conn,
+	}
+
+	es.AlertStructs[uid] = alertStruct
+
+	return uid, conn
 }
 
 // removeAlertStruct Function
-func (ls *LogService) removeAlertStruct(uid string) {
-	AlertLock.Lock()
-	defer AlertLock.Unlock()
+func (es *EventStructs) RemoveAlertStruct(uid string) {
+	es.AlertLock.Lock()
+	defer es.AlertLock.Unlock()
 
-	delete(AlertStructs, uid)
-
-	kg.Printf("Deleted the client (%s) for WatchAlerts", uid)
-}
-
-// WatchAlerts Function
-func (ls *LogService) WatchAlerts(req *pb.RequestMessage, svr pb.LogService_WatchAlertsServer) error {
-	uid := uuid.Must(uuid.NewRandom()).String()
-
-	if req.Filter != "all" && req.Filter != "policy" {
-		return nil
-	}
-	conn := make(chan *pb.Alert, QueueSize)
-	defer close(conn)
-	ls.addAlertStruct(uid, conn, req.Filter)
-	defer ls.removeAlertStruct(uid)
-
-	for Running {
-		select {
-		case <-svr.Context().Done():
-			return nil
-		case resp := <-conn:
-			if status, ok := status.FromError(svr.Send(resp)); ok {
-				switch status.Code() {
-				case codes.OK:
-					// noop
-				case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-					kg.Warnf("Failed to send an alert=[%+v] err=[%s]", resp, status.Err().Error())
-					return status.Err()
-				default:
-					return nil
-				}
-			}
-		}
-	}
-
-	return nil
+	delete(es.AlertStructs, uid)
 }
 
 // addLogStruct Function
-func (ls *LogService) addLogStruct(uid string, conn chan *pb.Log, filter string) {
-	LogLock.Lock()
-	defer LogLock.Unlock()
+func (es *EventStructs) AddLogStruct(filter string, queueSize int) (string, chan *pb.Log) {
+	es.LogLock.Lock()
+	defer es.LogLock.Unlock()
 
-	logStruct := LogStruct{}
-	logStruct.Filter = filter
-	logStruct.Broadcast = conn
-	LogStructs[uid] = logStruct
+	uid := uuid.Must(uuid.NewRandom()).String()
+	conn := make(chan *pb.Log, queueSize)
 
-	kg.Printf("Added a new client (%s, %s) for WatchLogs", uid, filter)
+	logStruct := EventStruct[pb.Log]{
+		Filter:    filter,
+		Broadcast: conn,
+	}
+
+	es.LogStructs[uid] = logStruct
+
+	return uid, conn
 }
 
 // removeLogStruct Function
-func (ls *LogService) removeLogStruct(uid string) {
-	LogLock.Lock()
-	defer LogLock.Unlock()
+func (es *EventStructs) RemoveLogStruct(uid string) {
+	es.LogLock.Lock()
+	defer es.LogLock.Unlock()
 
-	delete(LogStructs, uid)
-
-	kg.Printf("Deleted the client (%s) for WatchLogs", uid)
-}
-
-// WatchLogs Function
-func (ls *LogService) WatchLogs(req *pb.RequestMessage, svr pb.LogService_WatchLogsServer) error {
-	uid := uuid.Must(uuid.NewRandom()).String()
-
-	if req.Filter != "all" && req.Filter != "system" {
-		return nil
-	}
-	conn := make(chan *pb.Log, QueueSize)
-	defer close(conn)
-	ls.addLogStruct(uid, conn, req.Filter)
-	defer ls.removeLogStruct(uid)
-
-	for Running {
-		select {
-		case <-svr.Context().Done():
-			return nil
-		case resp := <-conn:
-			if status, ok := status.FromError(svr.Send(resp)); ok {
-				switch status.Code() {
-				case codes.OK:
-					// noop
-				case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-					kg.Warnf("Failed to send a log=[%+v] err=[%s] CODE=%d", resp, status.Err().Error(), status.Code())
-					return status.Err()
-				default:
-					return nil
-				}
-			}
-		}
-	}
-
-	return nil
+	delete(es.LogStructs, uid)
 }
 
 // ============ //
 // == Feeder == //
 // ============ //
+type FeederInterface interface {
+	// Methods
 
-// Feeder Structure
-type Feeder struct {
+	// How does the feeder pushes logs and messages
+	PushLog(tp.Log)
+	PushMessage(string, string)
+
+	// How does this feeder match log with policy
+	UpdateMatchedPolicy(tp.Log)
+
+	// How this feeder serves log feeds
+	ServeLogFeeds()
+}
+
+type BaseFeeder struct {
 	// node
 	Node     *tp.Node
 	NodeLock **sync.RWMutex
 
-	// port
-	Port string
+	// wait group
+	WgServer sync.WaitGroup
 
 	// output
 	Output  string
 	LogFile *os.File
+
+	// Activated Enforcer
+	Enforcer     string
+	EnforcerLock *sync.RWMutex
+
+	// Msg, log and alert connection stores
+	EventStructs *EventStructs
+
+	// True if feeder and its workers are working
+	Running bool
+
+	// Number of dropped logs
+	DroppedLogs uint64
+
+	// LogServer //
+
+	// port
+	Port string
 
 	// gRPC listener
 	Listener net.Listener
@@ -283,8 +233,26 @@ type Feeder struct {
 	// log server
 	LogServer *grpc.Server
 
-	// wait group
-	WgServer sync.WaitGroup
+	// username map
+	UserNameMap UserNameMap
+}
+
+type OuterKey struct {
+	PidNs uint32
+	MntNs uint32
+}
+
+type AlertThrottleState struct {
+	FirstEventTimestamp uint64
+	EventCount          uint64
+	Throttle            bool
+}
+
+// Feeder Structure
+type Feeder struct {
+	BaseFeeder
+
+	// KubeArmor feeder //
 
 	// namespace name + endpoint name / host name -> corresponding security policies
 	SecurityPolicies     map[string]tp.MatchPolicies
@@ -294,23 +262,31 @@ type Feeder struct {
 	DefaultPostures     map[string]tp.DefaultPosture
 	DefaultPosturesLock *sync.Mutex
 
-	// GKE
-	IsGKE bool
+	AlertMap     map[OuterKey]AlertThrottleState
+	AlertMapLock sync.RWMutex
 
-	// Activated Enforcer
-	Enforcer string
+	ContainerNsKey map[string]common.OuterKey
 }
 
 // NewFeeder Function
-func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
+func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) (feeder *Feeder) {
 	fd := &Feeder{}
+
+	defer func() {
+		if feeder == nil {
+			if err := fd.DestroyFeeder(); err != nil {
+				kg.Errf("Failed to destroy feeder: %v", err)
+			}
+		}
+	}()
+	// base feeder //
 
 	// node
 	fd.Node = node
 	fd.NodeLock = nodeLock
 
-	// gRPC configuration
-	fd.Port = fmt.Sprintf(":%s", cfg.GlobalCfg.GRPC)
+	// set wait group
+	fd.WgServer = sync.WaitGroup{}
 
 	// output
 	fd.Output = cfg.GlobalCfg.LogPath
@@ -325,6 +301,31 @@ func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
 		}
 		fd.LogFile = logFile
 	}
+
+	// default enforcer
+	fd.Enforcer = "eBPF Monitor"
+	fd.EnforcerLock = new(sync.RWMutex)
+
+	// initialize msg structs
+	fd.EventStructs = &EventStructs{
+		MsgStructs: make(map[string]EventStruct[pb.Message]),
+		MsgLock:    sync.RWMutex{},
+
+		// initialize alert structs
+		AlertStructs: make(map[string]EventStruct[pb.Alert]),
+		AlertLock:    sync.RWMutex{},
+
+		// initialize log structs
+		LogStructs: make(map[string]EventStruct[pb.Log]),
+		LogLock:    sync.RWMutex{},
+	}
+
+	fd.Running = true
+
+	// LogServer //
+
+	// gRPC configuration
+	fd.Port = fmt.Sprintf(":%s", cfg.GlobalCfg.GRPC)
 
 	// listen to gRPC port
 	listener, err := net.Listen("tcp", fd.Port)
@@ -359,26 +360,41 @@ func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
 	}
 
 	// create a log server
-	fd.LogServer = grpc.NewServer()
 
-	// register a log service
-	logService := &LogService{}
+	logService := &LogService{
+		QueueSize:    1000,
+		Running:      &fd.Running,
+		EventStructs: fd.EventStructs,
+	}
+
+	kaep := keepalive.EnforcementPolicy{
+		PermitWithoutStream: true,
+	}
+	kasp := keepalive.ServerParameters{
+		Time:    1 * time.Second,
+		Timeout: 5 * time.Second,
+	}
+
+	if cfg.GlobalCfg.TLSEnabled {
+		tlsCredentials, err := loadTLSCredentials(node.NodeIP)
+		if err != nil {
+			kg.Errf("cannot load TLS credentials: %s", err)
+			return nil
+		}
+		kg.Print("Server started with tls enabled")
+		// create a log server
+		fd.LogServer = grpc.NewServer(
+			grpc.Creds(tlsCredentials),
+			grpc.KeepaliveEnforcementPolicy(kaep),
+			grpc.KeepaliveParams(kasp),
+		)
+	} else {
+		fd.LogServer = grpc.NewServer(grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp))
+	}
+
 	pb.RegisterLogServiceServer(fd.LogServer, logService)
 
-	// initialize msg structs
-	MsgStructs = make(map[string]MsgStruct)
-	MsgLock = &sync.RWMutex{}
-
-	// initialize alert structs
-	AlertStructs = make(map[string]AlertStruct)
-	AlertLock = &sync.RWMutex{}
-
-	// initialize log structs
-	LogStructs = make(map[string]LogStruct)
-	LogLock = &sync.RWMutex{}
-
-	// set wait group
-	fd.WgServer = sync.WaitGroup{}
+	// Feeder //
 
 	// initialize security policies
 	fd.SecurityPolicies = map[string]tp.MatchPolicies{}
@@ -388,26 +404,18 @@ func NewFeeder(node *tp.Node, nodeLock **sync.RWMutex) *Feeder {
 	fd.DefaultPostures = map[string]tp.DefaultPosture{}
 	fd.DefaultPosturesLock = new(sync.Mutex)
 
-	// check if GKE
-	if kl.IsInK8sCluster() {
-		if b, err := os.ReadFile(filepath.Clean("/media/root/etc/os-release")); err == nil {
-			s := string(b)
-			if strings.Contains(s, "Container-Optimized OS") {
-				fd.IsGKE = true
-			}
-		}
+	fd.UserNameMap = UserNameMap{
+		usernames: make(map[uint32]cachedUserName),
+		ttl:       10 * time.Minute,
 	}
-
-	// default enforcer
-	fd.Enforcer = "eBPF Monitor"
 
 	return fd
 }
 
 // DestroyFeeder Function
-func (fd *Feeder) DestroyFeeder() error {
+func (fd *BaseFeeder) DestroyFeeder() error {
 	// stop gRPC service
-	Running = false
+	fd.Running = false
 
 	// wait for a while
 	time.Sleep(time.Second * 1)
@@ -464,7 +472,7 @@ func (fd *Feeder) Print(message string) {
 }
 
 // Printf Function
-func (fd *Feeder) Printf(message string, args ...interface{}) {
+func (fd *Feeder) Printf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("INFO", str)
 	kg.Print(str)
@@ -477,7 +485,7 @@ func (fd *Feeder) Debug(message string) {
 }
 
 // Debugf Function
-func (fd *Feeder) Debugf(message string, args ...interface{}) {
+func (fd *Feeder) Debugf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("DEBUG", str)
 	kg.Debug(str)
@@ -490,7 +498,7 @@ func (fd *Feeder) Err(message string) {
 }
 
 // Errf Function
-func (fd *Feeder) Errf(message string, args ...interface{}) {
+func (fd *Feeder) Errf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("ERROR", str)
 	kg.Err(str)
@@ -503,7 +511,7 @@ func (fd *Feeder) Warn(message string) {
 }
 
 // Warnf Function
-func (fd *Feeder) Warnf(message string, args ...interface{}) {
+func (fd *Feeder) Warnf(message string, args ...any) {
 	str := fmt.Sprintf(message, args...)
 	fd.PushMessage("WARN", str)
 	kg.Warnf(str)
@@ -515,7 +523,9 @@ func (fd *Feeder) Warnf(message string, args ...interface{}) {
 
 // UpdateEnforcer Function
 func (fd *Feeder) UpdateEnforcer(enforcer string) {
+	fd.EnforcerLock.Lock()
 	fd.Enforcer = enforcer
+	fd.EnforcerLock.Unlock()
 }
 
 // =============== //
@@ -523,7 +533,7 @@ func (fd *Feeder) UpdateEnforcer(enforcer string) {
 // =============== //
 
 // ServeLogFeeds Function
-func (fd *Feeder) ServeLogFeeds() {
+func (fd *BaseFeeder) ServeLogFeeds() {
 	fd.WgServer.Add(1)
 	defer fd.WgServer.Done()
 
@@ -547,6 +557,7 @@ func (fd *Feeder) PushMessage(level, message string) {
 	pbMsg.Timestamp = timestamp
 	pbMsg.UpdatedTime = updatedTime
 
+	// pbMsg.ClusterName = cfg.GlobalCfg.Cluster
 	pbMsg.ClusterName = cfg.GlobalCfg.Cluster
 
 	pbMsg.HostName = cfg.GlobalCfg.Host
@@ -557,17 +568,18 @@ func (fd *Feeder) PushMessage(level, message string) {
 	pbMsg.Level = level
 	pbMsg.Message = message
 
-	MsgLock.Lock()
-	defer MsgLock.Unlock()
+	// broadcast to all logserver and reverselogserver receivers
+	fd.EventStructs.MsgLock.Lock()
+	defer fd.EventStructs.MsgLock.Unlock()
 	counter := 0
-	lenMsg := len(MsgStructs)
-	for uid := range MsgStructs {
+	lenMsg := len(fd.EventStructs.MsgStructs)
+	for uid := range fd.EventStructs.MsgStructs {
 		select {
-		case MsgStructs[uid].Broadcast <- &pbMsg:
+		case fd.EventStructs.MsgStructs[uid].Broadcast <- &pbMsg:
 		default:
 			counter++
 			if counter == lenMsg {
-				//Default on the last uid in Messagestruct means the msg isnt pushed into Broadcast
+				// Default on the last uid in Messagestruct means the msg isn't pushed into Broadcast
 				kg.Printf("msg channel busy, msg dropped")
 			}
 
@@ -575,27 +587,142 @@ func (fd *Feeder) PushMessage(level, message string) {
 	}
 }
 
-// PushLog Function
-func (fd *Feeder) PushLog(log tp.Log) {
+func MarshalVisibilityLog(log tp.Log) *pb.Log {
+	pbLog := pb.Log{}
 
-	if cfg.GlobalCfg.EnforcerAlerts && fd.Enforcer == "BPFLSM" && log.Enforcer != "BPFLSM" {
-		log = fd.UpdateMatchedPolicy(log)
-		if (log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy") && (strings.Contains(log.PolicyName, "DefaultPosture") || !strings.Contains(log.Action, "Audit")) {
-			if log.Type == "MatchedPolicy" {
-				log.Type = "ContainerLog"
-			} else if log.Type == "MatchedHostPolicy" {
-				log.Type = "HostLog"
-			}
-		}
-	} else {
-		log = fd.UpdateMatchedPolicy(log)
-		if fd.Enforcer == "BPFLSM" {
-			log.Enforcer = "BPFLSM"
+	pbLog.Timestamp = log.Timestamp
+	pbLog.UpdatedTime = log.UpdatedTime
+
+	pbLog.ClusterName = cfg.GlobalCfg.Cluster
+
+	pbLog.NamespaceName = log.NamespaceName
+
+	var owner *pb.Podowner
+	if log.Owner != nil && (log.Owner.Ref != "" || log.Owner.Name != "" || log.Owner.Namespace != "") {
+		owner = &pb.Podowner{
+			Ref:       log.Owner.Ref,
+			Name:      log.Owner.Name,
+			Namespace: log.Owner.Namespace,
 		}
 	}
 
+	if pbLog.Owner == nil && owner != nil {
+		pbLog.Owner = owner
+	}
+
+	pbLog.PodName = log.PodName
+	pbLog.Labels = log.Labels
+
+	pbLog.ContainerID = log.ContainerID
+	pbLog.ContainerName = log.ContainerName
+	pbLog.ContainerImage = log.ContainerImage
+
+	pbLog.HostPPID = log.HostPPID
+	pbLog.HostPID = log.HostPID
+
+	pbLog.PPID = log.PPID
+	pbLog.PID = log.PID
+	pbLog.UID = log.UID
+
+	pbLog.ParentProcessName = log.ParentProcessName
+	pbLog.ProcessName = log.ProcessName
+
+	pbLog.Type = log.Type
+	pbLog.TTY = log.TTY
+	pbLog.Source = log.Source
+	pbLog.Operation = log.Operation
+	if !(pbLog.Operation == "Process" && cfg.GlobalCfg.DropResourceFromProcessLogs) {
+		pbLog.Resource = strings.ToValidUTF8(log.Resource, "")
+	}
+	pbLog.Cwd = log.Cwd
+
+	pbLog.ExecEvent = &pb.ExecEvent{
+		ExecID:         log.ExecEvent.ExecID,
+		ExecutableName: log.ExecEvent.ExecutableName,
+	}
+
+	if len(log.Data) > 0 {
+		pbLog.Data = log.Data
+	}
+	if log.EventData != nil {
+		pbLog.EventData = log.EventData
+	}
+	pbLog.ProcessHash = log.ProcessHash[:]
+	pbLog.ParentHash = log.ParentHash[:]
+	pbLog.ResourceHash = log.ResourceHash[:]
+	if len(log.HashAlgo) > 0 {
+		pbLog.HashAlgo = log.HashAlgo
+	}
+
+	pbLog.Result = log.Result
+	return &pbLog
+}
+
+// PushLog Function
+func (fd *Feeder) PushLog(log tp.Log) {
+	// Safety net: recover from any 'send on closed channel' panics that may
+	// occur due to a race window between RemoveLogStruct and PushLog.
+	defer func() {
+		if r := recover(); r != nil {
+			kg.Printf("PushLog: recovered from panic (send on closed channel during client disconnect): %v", r)
+		}
+	}()
+
+	/* if enforcer == BPFLSM and log.Enforcer == ebpfmonitor ( block and default Posture Alerts from System
+	   monitor are converted to host/container logs)
+	   in case of enforcer = AppArmor only Default Posture logs will be converted to
+	   container/host log depending upon the defaultPostureLogs flag
+	*/
+	isBPFLSM := fd.GetEnforcer() == "BPFLSM"
+	if !common.IsPresetEnforcer(log.Enforcer) {
+		if (cfg.GlobalCfg.EnforcerAlerts && isBPFLSM && log.Enforcer == "") || (!isBPFLSM && !cfg.GlobalCfg.DefaultPostureLogs) {
+			log = fd.UpdateMatchedPolicy(log)
+			isDefaultPostureLog := strings.Contains(log.PolicyName, "DefaultPosture")
+			isAudit := strings.Contains(log.Action, "Audit")
+			if (log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy") && ((isBPFLSM && (isDefaultPostureLog || !isAudit)) || (!isBPFLSM && isDefaultPostureLog)) {
+				switch log.Type {
+				case "MatchedPolicy":
+					log.Type = "ContainerLog"
+				case "MatchedHostPolicy":
+					log.Type = "HostLog"
+				}
+			}
+		} else {
+			log = fd.UpdateMatchedPolicy(log)
+			if isBPFLSM {
+				log.Enforcer = "BPFLSM"
+			}
+		}
+	}
+
+	// change enforcer and format log Resource
+	if log.Operation == "Device" {
+		log.Enforcer = "USBDeviceHandler"
+
+		parts := strings.SplitN(log.Resource, " ", 2) // ["USB", "MASS-STORAGE_6_80"]
+		classPart := strings.SplitN(parts[1], "_", 2)[0]
+		log.Resource = parts[0] + " " + classPart
+	}
+
+	if log.Operation == "NetworkFirewall" {
+		log.Enforcer = "NetworkPolicyEnforcer"
+
+		parts := strings.Split(log.Resource, " ") // policyName chain(INPUT/OUTPUT) action(Audit/Block)
+		direction := "INGRESS"
+		if len(parts) > 2 {
+			if parts[1] == "OUTPUT" || strings.ToUpper(parts[1]) == "EGRESS" {
+				direction = "EGRESS"
+			}
+		}
+		log.Resource = direction
+	}
+
 	if log.Source == "" {
-		if log.Type == "HostLog" {
+		// even if a log doesn't have a source, it must have a type
+		if log.Type == "" {
+			if strings.Contains(log.Enforcer, "PRESET") {
+				kg.Printf("no source and type: %s\n", log.Enforcer)
+			}
 			return
 		}
 		fd.Debug("Pushing Telemetry without source")
@@ -604,12 +731,36 @@ func (fd *Feeder) PushLog(log tp.Log) {
 	// set hostname
 	log.HostName = cfg.GlobalCfg.Host
 
+	// populate EventData by merging structured data from Data and Resource
+	var mergedEventData map[string]string
+	if len(log.Data) > 0 {
+		mergedEventData = parseDataString(log.Data)
+	}
+	// populate Resource data only for Network operations
+	if len(log.Resource) > 0 && log.Operation == "Network" {
+		if mergedEventData == nil {
+			mergedEventData = parseDataString(log.Resource)
+		} else {
+			for k, v := range parseDataString(log.Resource) {
+				mergedEventData[k] = v
+			}
+		}
+	}
+	if mergedEventData != nil {
+		log.EventData = mergedEventData
+	}
+
 	// remove flags
 	log.PolicyEnabled = 0
 	log.ProcessVisibilityEnabled = false
 	log.FileVisibilityEnabled = false
 	log.NetworkVisibilityEnabled = false
 	log.CapabilitiesVisibilityEnabled = false
+
+	if log.Type == "MatchedHostPolicy" || log.Type == "HostLog" {
+		// getting username is supported for host alerts only due to performance overhead
+		log.UserName = fd.UserNameMap.GetUsername(uint32(log.UID))
+	}
 
 	// standard output / file output
 	if fd.Output == "stdout" {
@@ -621,14 +772,33 @@ func (fd *Feeder) PushLog(log tp.Log) {
 	}
 
 	// gRPC output
-	if log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy" {
+	if log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy" || log.Type == "SystemEvent" {
+
+		// checking throttling condition for "Audit" alerts when enforcer is 'eBPF Monitor'
+		if cfg.GlobalCfg.AlertThrottling && ((strings.Contains(log.Action, "Audit") && log.Enforcer == "eBPF Monitor") || (log.Type == "MatchedHostPolicy" && (log.Enforcer == "AppArmor" || log.Enforcer == "eBPF Monitor"))) {
+			nsKey := fd.ContainerNsKey[log.ContainerID]
+			alert, throttle := fd.ShouldDropAlertsPerContainer(nsKey.PidNs, nsKey.MntNs)
+			if alert && throttle {
+				return
+			} else if alert && !throttle {
+				log.Operation = "AlertThreshold"
+				log.Type = "SystemEvent"
+				log.MaxAlertsPerSec = cfg.GlobalCfg.MaxAlertPerSec
+				log.DroppingAlertsInterval = cfg.GlobalCfg.ThrottleSec
+			}
+		}
 		pbAlert := pb.Alert{}
+
+		node := fd.GetNodeInfo()
+
+		pbAlert.KubeArmorVersion = log.KubeArmorVersion
 
 		pbAlert.Timestamp = log.Timestamp
 		pbAlert.UpdatedTime = log.UpdatedTime
 
-		pbAlert.ClusterName = fd.Node.ClusterName
-		pbAlert.HostName = fd.Node.NodeName
+		pbAlert.ClusterName = cfg.GlobalCfg.Cluster
+		pbAlert.HostName = node.NodeName
+		pbAlert.NodeID = node.NodeID
 
 		pbAlert.NamespaceName = log.NamespaceName
 
@@ -670,7 +840,7 @@ func (fd *Feeder) PushLog(log tp.Log) {
 			pbAlert.PolicyName = log.PolicyName
 		}
 
-		if len(log.Severity) > 0 {
+		if len(log.Severity) > 0 && log.Severity != "0" {
 			pbAlert.Severity = log.Severity
 		}
 
@@ -684,105 +854,211 @@ func (fd *Feeder) PushLog(log tp.Log) {
 		}
 
 		pbAlert.Type = log.Type
+		pbAlert.TTY = log.TTY
 		pbAlert.Source = log.Source
 		pbAlert.Operation = log.Operation
 		pbAlert.Resource = strings.ToValidUTF8(log.Resource, "")
 		pbAlert.Cwd = log.Cwd
 
+		pbAlert.ExecEvent = &pb.ExecEvent{
+			ExecID:         log.ExecEvent.ExecID,
+			ExecutableName: log.ExecEvent.ExecutableName,
+		}
+
 		if len(log.Data) > 0 {
 			pbAlert.Data = log.Data
+		}
+		if log.EventData != nil {
+			pbAlert.EventData = log.EventData
+		}
+		pbAlert.ProcessHash = log.ProcessHash[:]
+		pbAlert.ParentHash = log.ParentHash[:]
+		pbAlert.ResourceHash = log.ResourceHash[:]
+		if len(log.HashAlgo) > 0 {
+			pbAlert.HashAlgo = log.HashAlgo
 		}
 
 		if len(log.Action) > 0 {
 			pbAlert.Action = log.Action
 		}
 
+		if log.Operation == "NetworkFirewall" {
+			pbAlert.Type = "MatchedNetworkPolicy"
+		}
+
 		pbAlert.Result = log.Result
+		pbAlert.MaxAlertsPerSec = log.MaxAlertsPerSec
+		pbAlert.DroppingAlertsInterval = log.DroppingAlertsInterval
 
-		AlertLock.Lock()
-		defer AlertLock.Unlock()
+		pbAlert.UserName = log.UserName
+
+		fd.EventStructs.AlertLock.Lock()
+		defer fd.EventStructs.AlertLock.Unlock()
 		counter := 0
-		lenAlert := len(AlertStructs)
-
-		for uid := range AlertStructs {
+		lenAlert := len(fd.EventStructs.AlertStructs)
+		for uid := range fd.EventStructs.AlertStructs {
 			select {
-			case AlertStructs[uid].Broadcast <- &pbAlert:
+			case fd.EventStructs.AlertStructs[uid].Broadcast <- &pbAlert:
 			default:
 				counter++
 				if counter == lenAlert {
-					//Default on the last uid in Alterstruct means the Alert isnt pushed into Broadcast
+					// Default on the last uid in Alterstruct means the Alert isn't pushed into Broadcast
 					kg.Printf("log channel busy, alert dropped.")
 				}
 
 			}
 		}
 	} else { // ContainerLog || HostLog
-		pbLog := pb.Log{}
-
-		pbLog.Timestamp = log.Timestamp
-		pbLog.UpdatedTime = log.UpdatedTime
-
-		pbLog.ClusterName = fd.Node.ClusterName
-		pbLog.HostName = fd.Node.NodeName
-
-		pbLog.NamespaceName = log.NamespaceName
-
-		var owner *pb.Podowner
-		if log.Owner != nil && (log.Owner.Ref != "" || log.Owner.Name != "" || log.Owner.Namespace != "") {
-			owner = &pb.Podowner{
-				Ref:       log.Owner.Ref,
-				Name:      log.Owner.Name,
-				Namespace: log.Owner.Namespace,
-			}
-		}
-
-		if pbLog.Owner == nil && owner != nil {
-			pbLog.Owner = owner
-		}
-
-		pbLog.PodName = log.PodName
-		pbLog.Labels = log.Labels
-
-		pbLog.ContainerID = log.ContainerID
-		pbLog.ContainerName = log.ContainerName
-		pbLog.ContainerImage = log.ContainerImage
-
-		pbLog.HostPPID = log.HostPPID
-		pbLog.HostPID = log.HostPID
-
-		pbLog.PPID = log.PPID
-		pbLog.PID = log.PID
-		pbLog.UID = log.UID
-
-		pbLog.ParentProcessName = log.ParentProcessName
-		pbLog.ProcessName = log.ProcessName
-
-		pbLog.Type = log.Type
-		pbLog.Source = log.Source
-		pbLog.Operation = log.Operation
-		pbLog.Resource = strings.ToValidUTF8(log.Resource, "")
-		pbLog.Cwd = log.Cwd
-
-		if len(log.Data) > 0 {
-			pbLog.Data = log.Data
-		}
-
-		pbLog.Result = log.Result
-
-		LogLock.Lock()
-		defer LogLock.Unlock()
+		node := fd.GetNodeInfo()
+		pbLog := MarshalVisibilityLog(log)
+		pbLog.HostName = node.NodeName
+		pbLog.NodeID = node.NodeID
+		pbLog.UserName = log.UserName
+		fd.EventStructs.LogLock.Lock()
+		defer fd.EventStructs.LogLock.Unlock()
 		counter := 0
-		lenlog := len(LogStructs)
-		for uid := range LogStructs {
+		lenlog := len(fd.EventStructs.LogStructs)
+		for uid := range fd.EventStructs.LogStructs {
 			select {
-			case LogStructs[uid].Broadcast <- &pbLog:
+			case fd.EventStructs.LogStructs[uid].Broadcast <- pbLog:
 			default:
 				counter++
 				if counter == lenlog {
-					//Default on the last uid in Logstuct means the log isnt pushed into Broadcase
-					kg.Printf("log channel busy, log dropped.")
+					// Default on the last uid in Logstuct means the log isn't pushed into Broadcast
+					fd.DroppedLogs++
+					if fd.DroppedLogs%10000 == 0 {
+						kg.Warnf("log channel busy, 10000 logs dropped.")
+						fd.DroppedLogs = 0
+					}
 				}
 			}
 		}
 	}
+}
+
+func loadTLSCredentials(ip string) (credentials.TransportCredentials, error) {
+	// create certificate configurations
+	serverCertConfig := cert.DefaultKubeArmorServerConfig
+	serverCertConfig.IPs = []string{ip}
+	serverCertConfig.NotAfter = time.Now().Add(365 * 24 * time.Hour) // valid for 1 year
+	// as of now daemonset creates certificates dynamically
+	tlsConfig := cert.TlsConfig{
+		CertCfg:      serverCertConfig,
+		CertProvider: cfg.GlobalCfg.TLSCertProvider,
+		CACertPath:   cert.GetCACertPath(config.GlobalCfg.TLSCertPath),
+	}
+	creds, err := cert.NewTlsCredentialManager(&tlsConfig).CreateTlsServerCredentials()
+	return creds, err
+}
+
+func (fd *Feeder) ShouldDropAlertsPerContainer(pidNs, mntNs uint32) (bool, bool) {
+	currentTimestamp := kl.GetCurrentTimeStamp()
+
+	key := OuterKey{
+		PidNs: pidNs,
+		MntNs: mntNs,
+	}
+
+	fd.AlertMapLock.Lock()
+	defer fd.AlertMapLock.Unlock()
+
+	if fd.AlertMap == nil {
+		fd.AlertMap = make(map[OuterKey]AlertThrottleState)
+	}
+
+	state, ok := fd.AlertMap[key]
+
+	if !ok {
+		newState := AlertThrottleState{
+			EventCount:          1,
+			FirstEventTimestamp: currentTimestamp,
+			Throttle:            false,
+		}
+		fd.AlertMap[key] = newState
+		return false, false
+	}
+
+	throttleSec := uint64(cfg.GlobalCfg.ThrottleSec) * 1000000000 // Throttle duration in nanoseconds
+	maxAlertPerSec := uint64(cfg.GlobalCfg.MaxAlertPerSec)
+
+	if state.Throttle {
+		timeDifference := currentTimestamp - state.FirstEventTimestamp
+		if timeDifference < throttleSec {
+			return true, true
+		}
+	}
+
+	timeDifference := currentTimestamp - state.FirstEventTimestamp
+
+	if timeDifference >= 1000000000 { // 1 second
+		state.FirstEventTimestamp = currentTimestamp
+		state.EventCount = 1
+		state.Throttle = false
+	} else {
+		state.EventCount++
+	}
+
+	if state.EventCount > maxAlertPerSec {
+		state.EventCount = 0
+		state.Throttle = true
+		fd.AlertMap[key] = state
+		return true, false
+	}
+
+	fd.AlertMap[key] = state
+	return false, false
+}
+
+func (fd *Feeder) DeleteAlertMapKey(outkey kl.OuterKey) {
+	fd.AlertMapLock.Lock()
+	defer fd.AlertMapLock.Unlock()
+	delete(fd.AlertMap, OuterKey{PidNs: outkey.PidNs, MntNs: outkey.MntNs})
+}
+
+func (fd *Feeder) GetEnforcer() string {
+	fd.EnforcerLock.RLock()
+	val := fd.Enforcer
+	fd.EnforcerLock.RUnlock()
+	return val
+}
+
+func (fd *Feeder) GetNodeInfo() tp.Node {
+	lock := *fd.NodeLock
+	lock.RLock()
+	defer lock.RUnlock()
+
+	node := *fd.Node
+	return node
+}
+
+func (uname *UserNameMap) GetUsername(uid uint32) string {
+	uname.mu.RLock()
+	entry, exists := uname.usernames[uid]
+	uname.mu.RUnlock()
+
+	// If it exists and hasn't expired, return cached value
+	if exists && time.Now().Before(entry.ExpiresAt) {
+		return entry.Username
+	}
+
+	// Entry is missing or expired. Add it to map.
+	uidStr := strconv.FormatUint(uint64(uid), 10)
+	u, err := user.LookupId(uidStr)
+
+	name := ""
+	if err != nil {
+		// notfound
+		name = ""
+	} else {
+		name = u.Username
+	}
+
+	// Update cache
+	uname.mu.Lock()
+	uname.usernames[uid] = cachedUserName{
+		Username:  name,
+		ExpiresAt: time.Now().Add(uname.ttl),
+	}
+	uname.mu.Unlock()
+	return name
 }

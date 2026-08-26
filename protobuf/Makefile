@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of KubeArmor
+# Copyright 2026 Authors of KubeArmor
 
 CURDIR=$(shell pwd)
 
-PROTOS:=kubearmor.proto kvm.proto policy.proto
+PROTOS:=kubearmor.proto kvm.proto policy.proto state.proto
 PBGO:=$(PROTOS:.proto=.pb.go)
 
 .PHONY: build

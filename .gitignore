@@ -3,6 +3,7 @@ kubearmor
 karmor
 snitch
 kubearmor-operator
+snitch-cmd
 
 # KubeArmor YAML Generator
 deploygen
@@ -23,9 +24,6 @@ contribution/vagrant/*.log
 # object files
 **/BPF/**/*.o
 
-# protobuf
-protobuf/go.sum
-
 # kernel header
 vmlinux.h
 
@@ -36,3 +34,17 @@ vmlinux.h
 
 # gingko test tmp file
 **/*.test
+
+#ignore go.work
+go.work
+go.work.sum
+
+# ignore hook and related binaries
+hook
+deployHook
+
+# allow hook directory
+!**/hook/
+
+# personal scratchpad for incubation reapplication work — not for upstream
+MEMORY.md

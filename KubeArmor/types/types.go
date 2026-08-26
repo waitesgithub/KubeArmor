@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package types is an extension of the CRD types.
 package types
@@ -29,11 +29,22 @@ type Container struct {
 	Labels        string   `json:"labels"`
 
 	AppArmorProfile string `json:"apparmorProfile"`
+	Privileged      bool   `json:"privileged"`
 
 	// == //
 
 	PidNS uint32 `json:"pidns"`
 	MntNS uint32 `json:"mntns"`
+	Pid   uint32 `json:"pid"`
+
+	// == //
+
+	NodeName      string `json:"node_name"`
+	NodeID        string `json:"node_id"`
+	ProtocolPort  string `json:"protocolPort"`
+	Status        string `json:"status"`
+	ContainerIP   string `json:"container_ip"`
+	LastUpdatedAt string `json:"last_updated_at"`
 
 	// == //
 
@@ -52,22 +63,38 @@ type PodOwner struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
+// Namespace struct
+type Namespace struct {
+	Name                    string `json:"name,omitempty"`
+	Labels                  string `json:"labels,omitempty"`
+	KubearmorFilePosture    string `json:"kubearmor_file_posture,omitempty"`
+	KubearmorNetworkPosture string `json:"kubearmor_network_posture,omitempty"`
+	LastUpdatedAt           string `json:"last_updated_at,omitempty"`
+
+	ContainerCount int `json:"container_count,omitempty"`
+}
+
 // EndPoint Structure
+// k8s: Endpoint ~= pod
+// non-k8s: Endpoint ~= container
 type EndPoint struct {
 	NamespaceName string `json:"namespaceName"`
 
-	EndPointName  string   `json:"endPointName"`
-	Owner         PodOwner `json:"owner,omitempty"`
-	ContainerName string   `json:"containerName"`
+	EndPointName  string `json:"endPointName"`
+	ContainerName string `json:"containerName"`
 
 	Labels     map[string]string `json:"labels"`
 	Identities []string          `json:"identities"`
 
 	Containers       []string `json:"containers"`
+	PodIP            string   `json:"podIP,omitempty"`
 	AppArmorProfiles []string `json:"apparmorProfiles"`
 	SELinuxProfiles  []string `json:"selinuxProfiles"`
 
 	SecurityPolicies []SecurityPolicy `json:"securityPolicies"`
+
+	// only needed for unorchestrated containers
+	PrivilegedContainers map[string]struct{} `json:"privilegdContainers"`
 
 	// == //
 
@@ -85,6 +112,7 @@ type Node struct {
 	ClusterName string `json:"clusterName"`
 	NodeName    string `json:"nodeName"`
 	NodeIP      string `json:"nodeIP"`
+	NodeID      string `json:"nodeID"`
 
 	Annotations map[string]string `json:"annotations"`
 	Labels      map[string]string `json:"labels"`
@@ -98,6 +126,10 @@ type Node struct {
 	KubeletVersion  string `json:"kubeletVersion"`
 
 	ContainerRuntimeVersion string `json:"containerRuntimeVersion"`
+
+	// == //
+
+	LastUpdatedAt string `json:"last_updated_at"`
 
 	// == //
 
@@ -126,6 +158,14 @@ type K8sPod struct {
 	Labels          map[string]string
 	Containers      map[string]string
 	ContainerImages map[string]string
+	PodIP           string
+
+	// using two maps here as it is inefficient to
+	// obtain either from just one
+	// for storing privilegd container names
+	PrivilegedContainers map[string]struct{}
+	// for storing privileged apparmor profile names
+	PrivilegedAppArmorProfiles map[string]struct{}
 }
 
 // K8sPodEvent Structure
@@ -175,6 +215,30 @@ type K8sKubeArmorHostPolicies struct {
 	Items []K8sKubeArmorHostPolicy `json:"items"`
 }
 
+// K8sKubeArmorNetworkPolicyEvent Structure
+type K8sKubeArmorNetworkPolicyEvent struct {
+	Type   string                    `json:"type"`
+	Object K8sKubeArmorNetworkPolicy `json:"object"`
+}
+
+// K8sKubeArmorNetworkPolicy Structure
+type K8sKubeArmorNetworkPolicy struct {
+	Metadata metav1.ObjectMeta   `json:"metadata"`
+	Spec     NetworkSecuritySpec `json:"spec"`
+	Status   K8sPolicyStatus     `json:"status,omitempty"`
+}
+
+// K8sKubeArmorHostPolicies Structure
+type K8sKubeArmorNetworkPolicies struct {
+	Items []K8sKubeArmorNetworkPolicy `json:"items"`
+}
+
+// ExecEvent struct
+type ExecEvent struct {
+	ExecID         string
+	ExecutableName string
+}
+
 // ============= //
 // == Logging == //
 // ============= //
@@ -188,6 +252,8 @@ type Log struct {
 	// host
 	ClusterName string `json:"clusterName,omitempty"`
 	HostName    string `json:"hostName"`
+	NodeID      string `json:"nodeID,omitempty"`
+	UserName    string `json:"username,omitempty"`
 
 	// k8s
 	NamespaceName string    `json:"namespaceName,omitempty"`
@@ -207,6 +273,9 @@ type Log struct {
 	PID      int32 `json:"pid"`
 	UID      int32 `json:"uid"`
 
+	// exec
+	ExecEvent ExecEvent `json:"execEvent"`
+
 	// process
 	ParentProcessName string `json:"parentProcessName"`
 	ProcessName       string `json:"processName"`
@@ -217,6 +286,9 @@ type Log struct {
 	// policy
 	PolicyName string `json:"policyName,omitempty"`
 
+	// KubeArmor Version
+	KubeArmorVersion string `json:"kubeArmorVersion,omitempty"`
+
 	// severity, tags, message
 	Severity string   `json:"severity,omitempty"`
 	Tags     string   `json:"tags,omitempty"`
@@ -224,16 +296,23 @@ type Log struct {
 	Message  string   `json:"message,omitempty"`
 
 	// log
-	Type      string `json:"type"`
-	Source    string `json:"source"`
-	Operation string `json:"operation"`
-	Resource  string `json:"resource"`
-	Cwd       string `json:"cwd"`
-	OID       int32  `json:"oid"`
-	Data      string `json:"data,omitempty"`
-	Action    string `json:"action,omitempty"`
-	Result    string `json:"result"`
-
+	Type                   string            `json:"type"`
+	Source                 string            `json:"source"`
+	Operation              string            `json:"operation"`
+	Resource               string            `json:"resource"`
+	Cwd                    string            `json:"cwd"`
+	TTY                    string            `json:"tty,omitempty"`
+	OID                    int32             `json:"oid"`
+	Data                   string            `json:"data,omitempty"`
+	EventData              map[string]string `json:"eventData,omitempty"`
+	ProcessHash            string            `json:"processHash,omitempty"`
+	ParentHash             string            `json:"parentHash,omitempty"`
+	ResourceHash           string            `json:"resourceHash,omitempty"`
+	HashAlgo               string            `json:"hashAlgo,omitempty"`
+	Action                 string            `json:"action,omitempty"`
+	Result                 string            `json:"result"`
+	MaxAlertsPerSec        int32             `json:"MaxAlertsPerSec,omitempty"`
+	DroppingAlertsInterval int32             `json:"DroppingAlertsInterval,omitempty"`
 	// == //
 
 	PolicyEnabled int `json:"policyEnabled,omitempty"`
@@ -261,6 +340,7 @@ type MatchPolicy struct {
 	OwnerOnly    bool
 	ReadOnly     bool
 	Recursive    bool
+	Pts          *bool
 
 	Regexp *regexp.Regexp
 	Native bool
@@ -284,11 +364,30 @@ const (
 	KubeArmorPolicyAudited  = 2
 )
 
+// MatchExpressionType Structure
+type MatchExpressionType struct {
+	Key      string   `json:"key,omitempty"`
+	Operator string   `json:"operator,omitempty"`
+	Values   []string `json:"values,omitempty"`
+}
+
 // SelectorType Structure
 type SelectorType struct {
-	MatchLabels map[string]string `json:"matchLabels,omitempty"`
-	Containers  []string          `json:"containers,omitempty"`
-	Identities  []string          `json:"identities,omitempty"` // set during policy update
+	// for KubeArmorPolicy
+	MatchLabels      map[string]string     `json:"matchLabels,omitempty"`
+	MatchExpressions []MatchExpressionType `json:"matchExpressions,omitempty"`
+
+	Containers []string `json:"containers,omitempty"`
+
+	// only for ksp
+	Identities []string `json:"identities,omitempty"` // set during policy update
+
+	// for ksp & csp - used in matchExpression, key: label
+	MatchExpIdentities []string `json:"matchExpIdentities,omitempty"`
+	NonIdentities      []string `json:"nonIdentities,omitempty"`
+
+	// only for csp
+	NamespaceList []string `json:"namespaceList,omitempty"` // set during policy update
 }
 
 // MatchSourceType Structure
@@ -298,9 +397,12 @@ type MatchSourceType struct {
 
 // ProcessPathType Structure
 type ProcessPathType struct {
-	Path       string            `json:"path"`
-	OwnerOnly  bool              `json:"ownerOnly,omitempty"`
-	FromSource []MatchSourceType `json:"fromSource,omitempty"`
+	Path        string            `json:"path,omitempty"`
+	ExecName    string            `json:"execname,omitempty"`
+	OwnerOnly   bool              `json:"ownerOnly,omitempty"`
+	FromSource  []MatchSourceType `json:"fromSource,omitempty"`
+	AllowedArgs []string          `json:"allowedArgs,omitempty"`
+	Pts         *bool             `json:"pts,omitempty"`
 
 	Severity int      `json:"severity,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
@@ -314,6 +416,7 @@ type ProcessDirectoryType struct {
 	Recursive  bool              `json:"recursive,omitempty"`
 	OwnerOnly  bool              `json:"ownerOnly,omitempty"`
 	FromSource []MatchSourceType `json:"fromSource,omitempty"`
+	Pts        *bool             `json:"pts,omitempty"`
 
 	Severity int      `json:"severity,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
@@ -349,6 +452,7 @@ type FilePathType struct {
 	Path       string            `json:"path"`
 	ReadOnly   bool              `json:"readOnly,omitempty"`
 	OwnerOnly  bool              `json:"ownerOnly,omitempty"`
+	Pts        *bool             `json:"pts,omitempty"`
 	FromSource []MatchSourceType `json:"fromSource,omitempty"`
 
 	Severity int      `json:"severity,omitempty"`
@@ -363,6 +467,7 @@ type FileDirectoryType struct {
 	ReadOnly   bool              `json:"readOnly,omitempty"`
 	Recursive  bool              `json:"recursive,omitempty"`
 	OwnerOnly  bool              `json:"ownerOnly,omitempty"`
+	Pts        *bool             `json:"pts,omitempty"`
 	FromSource []MatchSourceType `json:"fromSource,omitempty"`
 
 	Severity int      `json:"severity,omitempty"`
@@ -399,16 +504,27 @@ type FileType struct {
 type NetworkProtocolType struct {
 	Protocol   string            `json:"protocol"`
 	FromSource []MatchSourceType `json:"fromSource,omitempty"`
+	Pts        *bool             `json:"pts,omitempty"`
+	Severity   int               `json:"severity,omitempty"`
+	Tags       []string          `json:"tags,omitempty"`
+	Message    string            `json:"message,omitempty"`
+	Action     string            `json:"action,omitempty"`
+}
 
-	Severity int      `json:"severity,omitempty"`
-	Tags     []string `json:"tags,omitempty"`
-	Message  string   `json:"message,omitempty"`
-	Action   string   `json:"action,omitempty"`
+// MatchDNSQueryType Structure
+type MatchDNSQueryType struct {
+	Domain     string            `json:"domain"`
+	FromSource []MatchSourceType `json:"fromSource,omitempty"`
+	Severity   int               `json:"severity,omitempty"`
+	Tags       []string          `json:"tags,omitempty"`
+	Message    string            `json:"message,omitempty"`
+	Action     string            `json:"action,omitempty"`
 }
 
 // NetworkType Structure
 type NetworkType struct {
-	MatchProtocols []NetworkProtocolType `json:"matchProtocols,omitempty"`
+	MatchProtocols  []NetworkProtocolType `json:"matchProtocols,omitempty"`
+	MatchDNSQueries []MatchDNSQueryType   `json:"matchDNSQueries,omitempty"`
 
 	Severity int      `json:"severity,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
@@ -476,6 +592,51 @@ type SyscallsType struct {
 	Message  string   `json:"message,omitempty"`
 }
 
+// DeviceMatchType Structure
+type DeviceMatchType struct {
+	Class    string `json:"class"`
+	SubClass *int32 `json:"subClass,omitempty"`
+	Protocol *int32 `json:"protocol,omitempty"`
+	Level    *int32 `json:"level,omitempty"`
+
+	Severity int      `json:"severity,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Message  string   `json:"message,omitempty"`
+	Action   string   `json:"action,omitempty"`
+}
+
+// DeviceType Structure
+type DeviceType struct {
+	MatchDevice []DeviceMatchType `json:"matchDevice,omitempty"`
+
+	Severity int      `json:"severity,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Message  string   `json:"message,omitempty"`
+	Action   string   `json:"action,omitempty"`
+}
+
+// PresetName type
+type PresetName string
+
+// PresetType Structure
+type PresetType struct {
+	Name   PresetName `json:"name,omitempty"`
+	Action string     `json:"action,omitempty"`
+}
+
+const (
+	// AnonMapExec Preset
+	AnonMapExec PresetName = "anonymousMapExec"
+	// FilelessExec Preset
+	FilelessExec PresetName = "filelessExec"
+	// ProtectEnv Preset
+	ProtectEnv PresetName = "protectEnv"
+	// Exec Preset
+	Exec PresetName = "exec"
+	// ProtectProc Preset
+	ProtectProc PresetName = "protectProc"
+)
+
 // SecuritySpec Structure
 type SecuritySpec struct {
 	Selector SelectorType `json:"selector"`
@@ -485,10 +646,11 @@ type SecuritySpec struct {
 	Network      NetworkType      `json:"network,omitempty"`
 	Capabilities CapabilitiesType `json:"capabilities,omitempty"`
 	Syscalls     SyscallsType     `json:"syscalls,omitempty"`
+	Presets      []PresetType     `json:"presets,omitempty"`
 
 	AppArmor string `json:"apparmor,omitempty"`
 
-	Severity int      `json:"severity"`
+	Severity int      `json:"severity,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
 	Message  string   `json:"message,omitempty"`
 	Action   string   `json:"action"`
@@ -519,10 +681,11 @@ type HostSecuritySpec struct {
 	Network      NetworkType      `json:"network,omitempty"`
 	Capabilities CapabilitiesType `json:"capabilities,omitempty"`
 	Syscalls     SyscallsType     `json:"syscalls,omitempty"`
+	Device       DeviceType       `json:"device,omitempty"`
 
 	AppArmor string `json:"apparmor,omitempty"`
 
-	Severity int      `json:"severity"`
+	Severity int      `json:"severity,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
 	Message  string   `json:"message,omitempty"`
 	Action   string   `json:"action"`
@@ -538,7 +701,8 @@ type HostSecurityPolicy struct {
 type DefaultPosture struct {
 	FileAction         string `json:"file,omitempty"`
 	NetworkAction      string `json:"network,omitempty"`
-	CapabilitiesAction string `json:"capabilties,omitempty"`
+	CapabilitiesAction string `json:"capabilities,omitempty"`
+	DeviceAction       string `json:"device,omitempty"`
 }
 
 // Visibility Structure
@@ -546,7 +710,82 @@ type Visibility struct {
 	File         bool `json:"file,omitempty"`
 	Process      bool `json:"process,omitempty"`
 	Network      bool `json:"network,omitempty"`
-	Capabilities bool `json:"capabilties,omitempty"`
+	Capabilities bool `json:"capabilities,omitempty"`
+	DNS          bool `json:"dns,omitempty"`
+	IMA          bool `json:"ima,omitempty"`
+}
+
+// ============================= //
+// == Network Security Policy == //
+// ============================= //
+
+// IPBlock Structure
+type IPBlock struct {
+	CIDR string `json:"cidr,omitempty"`
+}
+
+// NetworkPeer Structure
+type NetworkPeer struct {
+	IPBlock *IPBlock `json:"ipBlock,omitempty"`
+}
+
+// PortType Structure
+type PortType struct {
+	Port     string `json:"port,omitempty"`
+	EndPort  *int32 `json:"endPort,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// IngressType Structure
+type IngressType struct {
+	From      []NetworkPeer `json:"from,omitempty"`
+	Interface []string      `json:"iface,omitempty"`
+	Ports     []PortType    `json:"ports,omitempty"`
+
+	Limit    string `json:"limit,omitempty"`
+	Duration string `json:"duration,omitempty"`
+
+	Severity int      `json:"severity,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Message  string   `json:"message,omitempty"`
+	Action   string   `json:"action"`
+}
+
+// EgressType Structure
+type EgressType struct {
+	To        []NetworkPeer `json:"to,omitempty"`
+	Interface []string      `json:"iface,omitempty"`
+	Ports     []PortType    `json:"ports,omitempty"`
+
+	Limit    string `json:"limit,omitempty"`
+	Duration string `json:"duration,omitempty"`
+
+	Severity int      `json:"severity,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Message  string   `json:"message,omitempty"`
+	Action   string   `json:"action"`
+}
+
+// NetworkSecuritySpec Structure
+type NetworkSecuritySpec struct {
+	NodeSelector NodeSelectorType `json:"nodeSelector"`
+	Selector     SelectorType     `json:"selector"`
+
+	Level string `json:"level,omitempty"`
+
+	Ingress []IngressType `json:"ingress,omitempty"`
+	Egress  []EgressType  `json:"egress,omitempty"`
+
+	Severity int      `json:"severity,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Message  string   `json:"message,omitempty"`
+	Action   string   `json:"action"`
+}
+
+// NetworkSecurityPolicy Structure
+type NetworkSecurityPolicy struct {
+	Metadata map[string]string   `json:"metadata"`
+	Spec     NetworkSecuritySpec `json:"spec"`
 }
 
 // ================== //
@@ -604,3 +843,20 @@ type PidNode struct {
 
 // KubeArmorHostPolicyEventCallback Function
 type KubeArmorHostPolicyEventCallback func(K8sKubeArmorHostPolicyEvent) pb.PolicyStatus
+
+// =========== //
+// == Hooks == //
+// =========== //
+
+type HookRequest struct {
+	Operation HookOperation `json:"operation"`
+	Detached  bool          `json:"detached"`
+	Container Container     `json:"container"`
+}
+
+type HookOperation int
+
+const (
+	HookContainerCreate HookOperation = iota
+	HookContainerDelete
+)

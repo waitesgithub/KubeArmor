@@ -1,33 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package common contains utility functions which are commonly used across packages and modules
 package common
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	kc "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
+	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// OuterKey struct
+type OuterKey struct {
+	PidNs uint32
+	MntNs uint32
+}
 
 // ============ //
 // == Common == //
 // ============ //
 
+const (
+	// grpc default is 4MB
+	// CRI i.e. containerd service can send msg extended upto 16MB
+	// https://github.com/containerd/containerd/blob/main/defaults/defaults.go#L22-L25
+	DefaultMaxRecvMaxSize = 16 << 20
+)
+
 // Clone Function
-func Clone(src, dst interface{}) error {
+func Clone(src, dst any) error {
 	arr, _ := json.Marshal(src)
 	return json.Unmarshal(arr, dst)
 }
@@ -38,7 +60,7 @@ func RemoveStringElement(slice []string, size int) []string {
 }
 
 // ContainsElement Function
-func ContainsElement(slice interface{}, element interface{}) bool {
+func ContainsElement(slice any, element any) bool {
 	switch reflect.TypeOf(slice).Kind() {
 	case reflect.Slice:
 		s := reflect.ValueOf(slice)
@@ -53,8 +75,26 @@ func ContainsElement(slice interface{}, element interface{}) bool {
 	return false
 }
 
+// MatchesRegex function
+func MatchesRegex(key, element string, array []string) bool {
+	for _, item := range array {
+		if strings.Contains(item, key) {
+			expr, err := regexp.CompilePOSIX(element)
+			if err != nil {
+				kg.Warnf("Failed to compile regex: %s", element)
+				return false
+			}
+
+			return expr.MatchString(item)
+		}
+	}
+
+	// key not found in array
+	return true
+}
+
 // ObjCommaCanBeExpanded Function
-func ObjCommaCanBeExpanded(objptr interface{}) bool {
+func ObjCommaCanBeExpanded(objptr any) bool {
 	ovptr := reflect.ValueOf(objptr)
 	if ovptr.Kind() != reflect.Ptr {
 		return false
@@ -89,7 +129,7 @@ func ObjCommaExpand(v reflect.Value) []string {
 }
 
 // ObjCommaExpandFirstDupOthers Function
-func ObjCommaExpandFirstDupOthers(objptr interface{}) {
+func ObjCommaExpandFirstDupOthers(objptr any) {
 	if ObjCommaCanBeExpanded(objptr) {
 		old := reflect.ValueOf(objptr).Elem()
 		new := reflect.New(reflect.TypeOf(objptr).Elem()).Elem()
@@ -254,7 +294,11 @@ func GetCommandOutputWithoutErr(cmd string, args []string) string {
 		return ""
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	go func() {
+		defer wg.Done()
 		defer func() {
 			if err = stdin.Close(); err != nil {
 				kg.Warnf("Error closing stdin %s\n", err)
@@ -262,6 +306,9 @@ func GetCommandOutputWithoutErr(cmd string, args []string) string {
 		}()
 		_, _ = io.WriteString(stdin, "values written to stdin are passed to cmd's standard input")
 	}()
+
+	// Wait for the stdin writing to complete
+	wg.Wait()
 
 	out, err := res.CombinedOutput()
 	if err != nil {
@@ -334,13 +381,13 @@ func IsK8sLocal() bool {
 
 	k8sConfig := os.Getenv("KUBECONFIG")
 	if k8sConfig != "" {
-		if _, err := os.Stat(filepath.Clean(k8sConfig)); err == nil {
+		if _, err := os.Stat(filepath.Clean(k8sConfig)); err == nil { // #nosec G703
 			return true
 		}
 	}
 
 	home := os.Getenv("HOME")
-	if _, err := os.Stat(filepath.Clean(home + "/.kube/config")); err == nil {
+	if _, err := os.Stat(filepath.Clean(home + "/.kube/config")); err == nil { // #nosec G703
 		return true
 	}
 
@@ -375,6 +422,9 @@ func IsK8sEnv() bool {
 	return false
 }
 
+// ContainerRuntimeSocketKeys contains FIFO ordered keys of container runtimes
+var ContainerRuntimeSocketKeys = []string{"docker", "containerd", "cri-o"}
+
 // ContainerRuntimeSocketMap Structure
 var ContainerRuntimeSocketMap = map[string][]string{
 	"docker": {
@@ -394,9 +444,27 @@ var ContainerRuntimeSocketMap = map[string][]string{
 	},
 }
 
+// NRISocketMap Structure
+var NRISocketMap = map[string][]string{
+	"nri": {
+		"/var/run/nri/nri.sock",
+		"/run/nri/nri.sock",
+	},
+}
+
+// GetNRISocket Function
+func GetNRISocket(ContainerRuntime string) string {
+	for _, candidate := range NRISocketMap["nri"] {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
 // GetCRISocket Function
 func GetCRISocket(ContainerRuntime string) string {
-	for k := range ContainerRuntimeSocketMap {
+	for _, k := range ContainerRuntimeSocketKeys {
 		if ContainerRuntime != "" && k != ContainerRuntime {
 			continue
 		}
@@ -424,7 +492,7 @@ func GetControllingPodOwner(ownerRefs []metav1.OwnerReference) *metav1.OwnerRefe
 // ==================== //
 
 // MatchIdentities Function
-func MatchIdentities(identities []string, superIdentities []string) bool {
+func MatchIdentities(identities, superIdentities []string) bool {
 	matched := true
 
 	// if nothing in identities, skip it
@@ -434,6 +502,81 @@ func MatchIdentities(identities []string, superIdentities []string) bool {
 
 	// if super identities not include identity, return false
 	for _, identity := range identities {
+
+		// match regex if container name or host name label present
+		if strings.Contains(identity, "kubearmor.io/container.name") {
+			if !MatchesRegex("kubearmor.io/container.name", identity, superIdentities) {
+				matched = false
+				break
+			}
+
+			continue
+		}
+
+		// kubearmor.io/hostnamereg=node-*, will match for kubearmor.io/hostname=node-1, kubearmor.io/hostname=node-2, etc
+		if strings.HasPrefix(identity, "kubearmor.io/hostnamereg=") {
+			pattern := strings.TrimPrefix(identity, "kubearmor.io/hostnamereg=")
+			pattern = strings.ReplaceAll(pattern, "*", ".*")
+			fullRegexElement := "kubearmor\\.io/hostname=" + pattern
+
+			if !MatchesRegex("kubearmor.io/hostname", fullRegexElement, superIdentities) {
+				matched = false
+				break
+			}
+			continue
+		}
+
+		// kubernetes.io/hostnamereg=node-*, will match for kubernetes.io/hostname=node-1, kubernetes.io/hostname=node-2, etc, but only in k8s env
+		if strings.HasPrefix(identity, "kubernetes.io/hostnamereg=") && IsK8sEnv() {
+			pattern := strings.TrimPrefix(identity, "kubernetes.io/hostnamereg=")
+			pattern = strings.ReplaceAll(pattern, "*", ".*")
+			fullRegexElement := "kubernetes\\.io/hostname=" + pattern
+
+			if !MatchesRegex("kubernetes.io/hostname", fullRegexElement, superIdentities) {
+				matched = false
+				break
+			}
+			continue
+		}
+
+		// comma-separated hostnames (kubearmor.io/hostname=node1,node2, kubernetes.io/hostname=node1,node2 in k8s env, or * for all hostnames)
+		if strings.HasPrefix(identity, "kubearmor.io/hostname=") || (strings.HasPrefix(identity, "kubernetes.io/hostname=") && IsK8sEnv()) {
+			parts := strings.SplitN(identity, "=", 2)
+
+			if len(parts) != 2 {
+				matched = false
+				break
+			}
+
+			key := parts[0] // kubearmor.io/hostname or kubernetes.io/hostname
+			found := false
+
+			for _, val := range strings.Split(parts[1], ",") {
+				if val == "*" {
+					// check if the target machine has ANY label starting with this key
+					for _, super := range superIdentities {
+						if strings.HasPrefix(super, key+"=") {
+							found = true
+							break
+						}
+					}
+				} else if ContainsElement(superIdentities, key+"="+val) {
+					// exact match
+					found = true
+				}
+
+				if found {
+					break
+				}
+			}
+
+			if !found {
+				matched = false
+				break
+			}
+			continue
+		}
+
 		if !ContainsElement(superIdentities, identity) {
 			matched = false
 			break
@@ -444,8 +587,42 @@ func MatchIdentities(identities []string, superIdentities []string) bool {
 	return matched
 }
 
+// MatchExpIdentities Function
+func MatchExpIdentities(selector tp.SelectorType, superIdentities []string) bool {
+	matched := false
+
+	identities := selector.MatchExpIdentities
+	nonIdentities := selector.NonIdentities
+
+	// no matchExp with key as label defined
+	if len(identities) == 0 && len(nonIdentities) == 0 {
+		return true
+	}
+
+	for _, identity := range identities {
+		if ContainsElement(superIdentities, identity) {
+			matched = true
+			break
+		}
+	}
+
+	for i, nonIdentity := range nonIdentities {
+		if ContainsElement(superIdentities, nonIdentity) {
+			matched = false
+			break
+		}
+		if i == len(nonIdentities)-1 {
+			// if nonIdentities are not matched, then return true
+			matched = true
+		}
+	}
+
+	// otherwise, return false
+	return matched
+}
+
 // WriteToFile writes given string to file as JSON
-func WriteToFile(val interface{}, destFile string) error {
+func WriteToFile(val any, destFile string) error {
 	j, err := json.Marshal(val)
 	if err != nil {
 		return err
@@ -455,4 +632,149 @@ func WriteToFile(val interface{}, destFile string) error {
 		return err
 	}
 	return nil
+}
+
+// ParseURL with/without scheme and return host, port or error
+func ParseURL(address string) (string, string, error) {
+	var host string
+	port := "80"
+
+	addr, err := url.Parse(address)
+	if err != nil || addr.Host == "" {
+		// URL without scheme
+		u, repErr := url.ParseRequestURI("http://" + address)
+		if repErr != nil {
+			return "", "", fmt.Errorf("Error while parsing URL: %s", err)
+		}
+
+		addr = u
+	}
+
+	host = addr.Hostname()
+	if addr.Port() != "" {
+		port = addr.Port()
+	}
+
+	return host, port, nil
+}
+
+// handle gRPC errors
+func HandleGRPCErrors(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if status, ok := status.FromError(err); ok {
+		switch status.Code() {
+		case codes.OK:
+			// noop
+			return nil
+		//case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+		//	return status.Err()
+		default:
+			return status.Err()
+		}
+	}
+
+	return nil
+}
+
+// get boot time
+// credits: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/util/boottime_util_linux.go
+func GetBootTime() string {
+	currentTime := time.Now()
+
+	var info unix.Sysinfo_t
+	if err := unix.Sysinfo(&info); err != nil {
+		return ""
+	}
+
+	return currentTime.Add(-time.Duration(info.Uptime) * time.Second).Truncate(time.Second).UTC().String()
+}
+
+func GetLabelsFromString(labelString string) (map[string]string, []string) {
+	labelsMap := make(map[string]string)
+
+	labelsSlice := strings.Split(labelString, ",")
+	for _, label := range labelsSlice {
+		key, value, ok := strings.Cut(label, "=")
+		if !ok {
+			continue
+		}
+
+		labelsMap[key] = value
+	}
+
+	slices.Sort(labelsSlice)
+
+	return labelsMap, labelsSlice
+}
+
+// provide current timestamp
+func GetCurrentTimeStamp() uint64 {
+	return uint64(time.Now().UnixNano())
+}
+
+// ============
+// == Feeder ==
+// ============
+
+// IsPresetEnforcer returns true if log is generated by any of preset enforcer
+func IsPresetEnforcer(enforcer string) bool {
+	return strings.Contains(enforcer, "PRESET")
+}
+
+func NormalizeIP(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ""
+	}
+	// Detect IPV4 and IPv6-mapped IPv4, and IPV6 Ips
+	// Example:
+	// "192.168.1.1",        // IPv4
+	// "2001:0db8::1",       // IPv6
+	// "::ffff:192.168.1.1", // IPv6-mapped IPv4
+	if ip.To4() != nil && !strings.Contains(ipStr, ":") {
+		return ipStr
+	} else {
+		return "[" + ipStr + "]" // IPv6
+	}
+}
+
+// errUnsafePathToRemove error
+var errUnsafePathToRemove = errors.New("unsafe path to remove")
+
+// isUnsafePathToRemove checks if path is empty or absolute root "/"
+// return true to mark the path unsafe to remove
+func isUnsafePathToRemove(path string) bool {
+	if path == "" {
+		return true
+	}
+
+	clean := filepath.Clean(path)
+
+	// root /
+	if clean == string(filepath.Separator) {
+		return true
+	}
+
+	return false
+}
+
+// RemoveSafe func remove the given path if it is safe(not empty or /)
+// to remove using os.Remove
+func RemoveSafe(path string) error {
+	if isUnsafePathToRemove(path) {
+		return errUnsafePathToRemove
+	}
+	return os.Remove(path)
+}
+
+// RemoveAllSafe func remove the given path if it is safe(not empty or /)
+// to remove using os.RemoveAll
+func RemoveAllSafe(path string) error {
+	if isUnsafePathToRemove(path) {
+		return errUnsafePathToRemove
+	}
+	return os.RemoveAll(path)
 }

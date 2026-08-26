@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package log contains log util wrappers for enhanced pretty logging
 package log
 
 import (
 	"encoding/json"
+	"os"
 	"time"
 
 	"go.uber.org/zap"
@@ -32,7 +33,7 @@ func customTimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
 // initLogger Function
 func initLogger() {
 	defaultConfig := []byte(`{
-		"level": "debug",
+		"level": "info",
 		"encoding": "console",
 		"outputPaths": ["stdout"],
 		"encoderConfig": {
@@ -59,7 +60,11 @@ func initLogger() {
 	}
 
 	config.EncoderConfig.EncodeTime = customTimeEncoder
-	config.Level.SetLevel(zap.DebugLevel) // if we need to set log level
+
+	// this is not read from config/viper as logger is initialized before config
+	if val, ok := os.LookupEnv("DEBUG"); ok && val == "true" {
+		config.Level.SetLevel(zap.DebugLevel) // set to enable debug logging
+	}
 
 	logger, err := config.Build()
 	if err != nil {
@@ -79,7 +84,7 @@ func Print(message string) {
 }
 
 // Printf Function
-func Printf(message string, args ...interface{}) {
+func Printf(message string, args ...any) {
 	zapLogger.Infof(message, args...)
 }
 
@@ -89,7 +94,7 @@ func Debug(message string) {
 }
 
 // Debugf Function
-func Debugf(message string, args ...interface{}) {
+func Debugf(message string, args ...any) {
 	zapLogger.Debugf(message, args...)
 }
 
@@ -99,7 +104,7 @@ func Err(message string) {
 }
 
 // Errf Function
-func Errf(message string, args ...interface{}) {
+func Errf(message string, args ...any) {
 	zapLogger.Errorf(message, args...)
 }
 
@@ -109,6 +114,6 @@ func Warn(message string) {
 }
 
 // Warnf Function
-func Warnf(message string, args ...interface{}) {
+func Warnf(message string, args ...any) {
 	zapLogger.Warnf(message, args...)
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package v1
 
@@ -16,6 +16,7 @@ type KubeArmorHostPolicySpec struct {
 	Network      HostNetworkType      `json:"network,omitempty"`
 	Capabilities HostCapabilitiesType `json:"capabilities,omitempty"`
 	Syscalls     SyscallsType         `json:"syscalls,omitempty"`
+	Device       DeviceType           `json:"device,omitempty"`
 
 	AppArmor string `json:"apparmor,omitempty"`
 
@@ -41,6 +42,9 @@ type KubeArmorHostPolicyStatus struct {
 // +genclient:nonNamespaced
 // +kubebuilder:resource:scope=Cluster,shortName=hsp
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="Action",type=string,JSONPath=`.spec.action`,priority=10
+// +kubebuilder:printcolumn:name="Selector",type=string,JSONPath=`.spec.nodeSelector.matchLabels`,priority=10
 type KubeArmorHostPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

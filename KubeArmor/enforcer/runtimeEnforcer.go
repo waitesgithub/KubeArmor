@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 // Package enforcer is responsible for setting up and handling policy updates for supported enforcers including AppArmor, SELinux and BPFLSM
 package enforcer
@@ -200,7 +200,7 @@ func (re *RuntimeEnforcer) UnregisterContainer(containerID string) {
 }
 
 // UpdateAppArmorProfiles Function
-func (re *RuntimeEnforcer) UpdateAppArmorProfiles(podName, action string, profiles map[string]string) {
+func (re *RuntimeEnforcer) UpdateAppArmorProfiles(podName string, action string, profiles map[string]string, privilegedProfiles map[string]struct{}) {
 	// skip if runtime enforcer is not active
 	if re == nil {
 		return
@@ -212,10 +212,12 @@ func (re *RuntimeEnforcer) UpdateAppArmorProfiles(podName, action string, profil
 				continue
 			}
 
+			_, privileged := privilegedProfiles[profile]
+
 			if action == "ADDED" {
-				re.appArmorEnforcer.RegisterAppArmorProfile(podName, profile)
+				re.appArmorEnforcer.RegisterAppArmorProfile(podName, profile, privileged)
 			} else if action == "DELETED" {
-				re.appArmorEnforcer.UnregisterAppArmorProfile(podName, profile)
+				re.appArmorEnforcer.UnregisterAppArmorProfile(podName, profile, privileged)
 			}
 		}
 	}

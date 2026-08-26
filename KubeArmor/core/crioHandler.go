@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package core
 
@@ -8,15 +8,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
+	"github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -48,7 +51,7 @@ var Crio *CrioHandler
 func NewCrioHandler() *CrioHandler {
 	ch := &CrioHandler{}
 
-	conn, err := grpc.Dial(cfg.GlobalCfg.CRISocket, grpc.WithInsecure())
+	conn, err := grpc.NewClient(cfg.GlobalCfg.CRISocket, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil
 	}
@@ -77,7 +80,7 @@ func (ch *CrioHandler) Close() {
 // ==================== //
 
 // GetContainerInfo Function gets info of a particular container
-func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string) (tp.Container, error) {
+func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID, nodeID string, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
 	// request to get status of specified container
 	// verbose has to be true to retrieve additional CRI specific info
 	req := &pb.ContainerStatusRequest{
@@ -92,22 +95,43 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string)
 
 	container := tp.Container{}
 
+	if res == nil {
+		return tp.Container{}, fmt.Errorf("container status response is nil")
+	}
+
 	// == container base == //
 	resContainerStatus := res.Status
+	if resContainerStatus == nil {
+		return tp.Container{}, fmt.Errorf("container status is nil")
+	}
 
 	container.ContainerID = resContainerStatus.Id
-	container.ContainerName = resContainerStatus.Metadata.Name
+
+	if resContainerStatus.Metadata != nil {
+		container.ContainerName = resContainerStatus.Metadata.Name
+	}
 
 	container.NamespaceName = "Unknown"
 	container.EndPointName = "Unknown"
 
 	// check container labels
-	containerLables := resContainerStatus.Labels
-	if val, ok := containerLables["io.kubernetes.pod.namespace"]; ok {
+	containerLabels := resContainerStatus.Labels
+	if val, ok := containerLabels["io.kubernetes.pod.namespace"]; ok {
 		container.NamespaceName = val
 	}
-	if val, ok := containerLables["io.kubernetes.pod.name"]; ok {
+	if val, ok := containerLabels["io.kubernetes.pod.name"]; ok {
 		container.EndPointName = val
+	}
+
+	if len(OwnerInfo) > 0 {
+		if podOwnerInfo, ok := OwnerInfo[container.EndPointName]; ok {
+			container.Owner = podOwnerInfo
+		}
+	}
+
+	if !cfg.GlobalCfg.K8sEnv {
+		container.NodeName = cfg.GlobalCfg.Host
+		container.NodeID = nodeID
 	}
 
 	// extracting the runtime specific "info"
@@ -118,11 +142,14 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string)
 	}
 
 	// path to container's root storage
-	container.AppArmorProfile = containerInfo.RuntimeSpec.Process.ApparmorProfile
+	if containerInfo.RuntimeSpec.Process != nil {
+		container.AppArmorProfile = containerInfo.RuntimeSpec.Process.ApparmorProfile
+	}
+	container.Privileged = containerInfo.Privileged
 
 	pid := strconv.Itoa(containerInfo.Pid)
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/pid"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/pid")); err == nil {
 		if _, err := fmt.Sscanf(data, "pid:[%d]\n", &container.PidNS); err != nil {
 			kg.Warnf("Unable to get PidNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
@@ -130,7 +157,7 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string)
 		return container, err
 	}
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/mnt"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/mnt")); err == nil {
 		if _, err := fmt.Sscanf(data, "mnt:[%d]\n", &container.MntNS); err != nil {
 			kg.Warnf("Unable to get MntNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
@@ -152,9 +179,11 @@ func (ch *CrioHandler) GetCrioContainers() (map[string]struct{}, error) {
 
 	req := pb.ListContainersRequest{}
 
-	if containerList, err := ch.client.ListContainers(context.Background(), &req); err == nil {
-		for _, container := range containerList.Containers {
-			containers[container.Id] = struct{}{}
+	if containerList, err := ch.client.ListContainers(context.Background(), &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
+		if containerList != nil {
+			for _, container := range containerList.Containers {
+				containers[container.Id] = struct{}{}
+			}
 		}
 
 		return containers, nil
@@ -193,21 +222,26 @@ func (ch *CrioHandler) GetDeletedCrioContainers(containers map[string]struct{}) 
 }
 
 // UpdateCrioContainer Function
-func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID, action string) bool {
+func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID, action string) error {
 	if Crio == nil {
-		return false
+		return fmt.Errorf("CRIO client not initialized")
 	}
 
 	if action == "start" {
 		// get container info from client
-		container, err := Crio.GetContainerInfo(ctx, containerID)
+		dm.OwnerInfoLock.RLock()
+		owner := dm.OwnerInfo
+		dm.OwnerInfoLock.RUnlock()
+		container, err := Crio.GetContainerInfo(ctx, containerID, dm.Node.NodeID, owner)
 		if err != nil {
-			return false
+			return fmt.Errorf("failed to get container info: %w", err)
 		}
 
 		if container.ContainerID == "" {
-			return false
+			return fmt.Errorf("container ID is empty")
 		}
+
+		endpoint := tp.EndPoint{}
 
 		dm.ContainersLock.Lock()
 		if _, ok := dm.Containers[container.ContainerID]; !ok {
@@ -240,19 +274,48 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 						dm.EndPoints[idx].AppArmorProfiles = append(dm.EndPoints[idx].AppArmorProfiles, container.AppArmorProfile)
 					}
 
+					if container.Privileged && dm.EndPoints[idx].PrivilegedContainers != nil {
+						dm.EndPoints[idx].PrivilegedContainers[container.ContainerName] = struct{}{}
+					}
+
+					endpoint = dm.EndPoints[idx]
+
 					break
 				}
 			}
 			dm.EndPointsLock.Unlock()
 		} else {
 			dm.ContainersLock.Unlock()
-			return false
+			return fmt.Errorf("container namespace information already exists")
 		}
 
 		if dm.SystemMonitor != nil && cfg.GlobalCfg.Policy {
+			// for throttling
+			dm.SystemMonitor.Logger.ContainerNsKey[containerID] = common.OuterKey{
+				MntNs: container.MntNS,
+				PidNs: container.PidNS,
+			}
+
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
-			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			if dm.RuntimeEnforcer != nil {
+				dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			}
+			if dm.Presets != nil {
+				dm.Presets.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			}
+
+			if len(endpoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
+				dm.Logger.UpdateSecurityPolicies("ADDED", endpoint)
+				if dm.RuntimeEnforcer != nil && endpoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(endpoint)
+				}
+				if dm.Presets != nil && endpoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(endpoint)
+				}
+			}
 		}
 
 		if !dm.K8sEnabled {
@@ -269,7 +332,7 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 		container, ok := dm.Containers[containerID]
 		if !ok {
 			dm.ContainersLock.Unlock()
-			return false
+			return fmt.Errorf("container not found for removal: %s", containerID)
 		}
 		if !dm.K8sEnabled {
 			dm.EndPointsLock.Lock()
@@ -297,15 +360,20 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 		dm.EndPointsLock.Unlock()
 
 		if dm.SystemMonitor != nil && cfg.GlobalCfg.Policy {
+			outkey := dm.SystemMonitor.Logger.ContainerNsKey[containerID]
+			dm.Logger.DeleteAlertMapKey(outkey)
+			delete(dm.SystemMonitor.Logger.ContainerNsKey, containerID)
 			// update NsMap
 			dm.SystemMonitor.DeleteContainerIDFromNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
-			dm.RuntimeEnforcer.UnregisterContainer(containerID)
+			if dm.RuntimeEnforcer != nil {
+				dm.RuntimeEnforcer.UnregisterContainer(containerID)
+			}
 		}
 
 		dm.Logger.Printf("Detected a container (removed/%.12s)", containerID)
 	}
 
-	return true
+	return nil
 }
 
 // MonitorCrioEvents Function
@@ -330,7 +398,11 @@ func (dm *KubeArmorDaemon) MonitorCrioEvents() {
 		default:
 			containers, err := Crio.GetCrioContainers()
 			if err != nil {
-				return
+				kg.Warnf("Failed to list CRI-O containers: %v", err)
+				if !dm.reconnectCrio() {
+					return
+				}
+				continue
 			}
 
 			invalidContainers := []string{}
@@ -340,7 +412,8 @@ func (dm *KubeArmorDaemon) MonitorCrioEvents() {
 
 			if len(newContainers) > 0 {
 				for containerID := range newContainers {
-					if !dm.UpdateCrioContainer(context.Background(), containerID, "start") {
+					if err := dm.UpdateCrioContainer(context.Background(), containerID, "start"); err != nil {
+						kg.Warnf("Failed to update CRIO container %s: %s", containerID, err.Error())
 						invalidContainers = append(invalidContainers, containerID)
 					}
 				}
@@ -352,11 +425,49 @@ func (dm *KubeArmorDaemon) MonitorCrioEvents() {
 
 			if len(deletedContainers) > 0 {
 				for containerID := range deletedContainers {
-					dm.UpdateCrioContainer(context.Background(), containerID, "destroy")
+					if err := dm.UpdateCrioContainer(context.Background(), containerID, "destroy"); err != nil {
+						kg.Warnf("Failed to destroy CRIO container %s: %s", containerID, err.Error())
+					}
 				}
 			}
 		}
 
 		time.Sleep(time.Millisecond * 50)
+	}
+}
+
+// reconnectCrio attempts to reconnect to CRI-O with backoff.
+// Returns true on success, false if StopChan is signaled during retry.
+func (dm *KubeArmorDaemon) reconnectCrio() bool {
+	const maxRetryInterval = 60 * time.Second
+	retryInterval := 5 * time.Second
+
+	for {
+		dm.Logger.Printf("Attempting to reconnect to CRI-O in %v...", retryInterval)
+
+		select {
+		case <-StopChan:
+			return false
+		case <-time.After(retryInterval):
+		}
+
+		newCrio := NewCrioHandler()
+		if newCrio == nil {
+			kg.Warn("Failed to reconnect to CRI-O")
+			retryInterval *= 2
+			if retryInterval > maxRetryInterval {
+				retryInterval = maxRetryInterval
+			}
+			continue
+		}
+
+		// Close old connection and replace handler
+		Crio.Close()
+		// Preserve the existing container map so we can diff correctly
+		newCrio.containers = Crio.containers
+		Crio = newCrio
+
+		dm.Logger.Print("Successfully reconnected to CRI-O")
+		return true
 	}
 }

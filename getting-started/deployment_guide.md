@@ -2,6 +2,8 @@
 
 This guide assumes you have access to a [k8s cluster](support_matrix.md). If you want to try non-k8s mode, for instance systemd mode to protect/audit containers or processes on VMs/bare-metal, check [here](kubearmor_vm.md).
 
+If you're deploying kubearmor on GKE autopilot follow the instructions provide with [GKE Autopilot Installation Guide](kubearmor_installation_on_gke_autopilot.md)
+
 Check the [KubeArmor support matrix](support_matrix.md) to verify if your platform is supported.
 
 ## Install KubeArmor
@@ -33,6 +35,7 @@ POD=$(kubectl get pod -l app=nginx -o name)
 
 > [!NOTE] 
 > `$POD` is used to refer to the target nginx pod in many cases below.
+
 
 ## Sample policies
 
@@ -73,6 +76,8 @@ It will be denied permission to execute.
 sh: 1: apt: Permission denied
 command terminated with exit code 126
 ```
+
+If you don't see Permission denied please refer [here](FAQ.md#debug-kubearmor-installation-issue-in-dockerized-kubernetes-environment) to debug this issue
 
 </details>
 
@@ -178,12 +183,22 @@ cat: /run/secrets/kubernetes.io/serviceaccount/token: Permission denied
 }
 ```
 
+If you don't see Permission denied please refer [here](FAQ.md#debug-kubearmor-installation) to debug this issue.
+
+
 </details>
 
 <details>
   <summary><h4>Audit access to folders/paths</h4></summary>
 
 Access to certain folders/paths might have to be audited for compliance/reporting reasons.
+
+File Visibility is disabled by default to minimize telemetry. Some file based policies will need that enabled. To enable file visibility on a namespace level:
+```
+kubectl annotate ns default kubearmor-visibility="process,file,network" --overwrite
+```
+
+For more details on this: https://docs.kubearmor.io/kubearmor/documentation/kubearmor_visibility#updating-namespace-visibility
 
 Lets audit access to `/etc/nginx/` folder within the deployment.
 ```
@@ -283,5 +298,7 @@ Lets try to execute some other processes:
 kubectl exec -it $POD -- bash -c "chroot"
 ```
 Any binary other than `bash` and `nginx` would be permission denied.
+
+If you don't see Permission denied please refer [here](FAQ.md#debug-kubearmor-installation) to debug this issue
 
 </details>

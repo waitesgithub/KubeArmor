@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 //go:build amd64
 // +build amd64
@@ -59,6 +59,15 @@ const (
 	SocketCreate  = 461
 	SocketConnect = 462
 	SocketAccept  = 463
+
+	Capable = 464
+
+	DropAlert = 0
+
+	UDPSendMsg = 10000
+	UDPSendSkb = 10001
+
+	SocketSendMsg = 465
 )
 
 var syscalls = map[int32]string{
@@ -412,4 +421,6 @@ var syscalls = map[int32]string{
 	461: "SOCKET_CREATE",
 	462: "SOCKET_CONNECT",
 	463: "SOCKET_ACCEPT",
+	464: "CAPABLE",
+	465: "SOCKET_SENDMSG",
 }

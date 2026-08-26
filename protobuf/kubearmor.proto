@@ -1,5 +1,5 @@
 syntax = "proto3";
- 
+
 package feeder;
 
 option go_package="github.com/kubearmor/KubeArmor/protobuf";
@@ -29,6 +29,12 @@ message Podowner {
   string Ref = 1;
   string Name = 2;
   string Namespace = 3;
+}
+
+// execevent struct
+message ExecEvent {
+  string ExecID = 1;
+  string ExecutableName = 2;
 }
 
 // alert struct
@@ -69,11 +75,24 @@ message Alert {
   string Operation = 19;
   string Resource = 20;
   string Data = 21;
-
+  map<string, string> EventData = 43;
   string Enforcer = 28;
   string Action = 22;
   string Result = 23;
   string Cwd = 32;
+  string TTY = 33;
+  int32 MaxAlertsPerSec = 34;
+  int32 DroppingAlertsInterval = 35;
+
+  ExecEvent ExecEvent = 36;
+
+  string KubeArmorVersion = 37;
+  string NodeID = 38;
+  string ProcessHash = 39;
+  string ParentHash = 40;
+  string ResourceHash = 41;
+  string HashAlgo = 42;
+  string UserName = 44;
 }
 
 // log struct
@@ -107,9 +126,19 @@ message Log {
   string Operation = 15;
   string Resource = 16;
   string Data = 17;
-
+  map<string, string> EventData = 33;
   string Result = 18;
   string Cwd = 25;
+  string TTY = 26;
+
+  ExecEvent ExecEvent = 27;
+
+  string NodeID = 28;
+  string ProcessHash = 29;
+  string ParentHash = 30;
+  string ResourceHash = 31;
+  string HashAlgo = 32;
+  string UserName = 34;
 }
 
 // request message
@@ -123,15 +152,9 @@ message ReplyMessage {
 }
 
 service LogService {
+  // DEPRECATED: use "google.golang.org/grpc/health/grpc_health_v1"
   rpc HealthCheck(NonceMessage) returns (ReplyMessage);
   rpc WatchMessages(RequestMessage) returns (stream Message);
   rpc WatchAlerts(RequestMessage) returns (stream Alert);
   rpc WatchLogs(RequestMessage) returns (stream Log);
-}
-
-service PushLogService {
-  rpc HealthCheck(NonceMessage) returns (ReplyMessage);
-  rpc PushMessages(stream Message) returns (stream ReplyMessage);
-  rpc PushAlerts(stream Alert) returns (stream ReplyMessage);
-  rpc PushLogs(stream Log) returns (stream ReplyMessage);
 }

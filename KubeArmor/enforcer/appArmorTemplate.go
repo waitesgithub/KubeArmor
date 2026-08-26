@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package enforcer
 
 // ProfileHeader contain sAppArmor Profile/SubProfile header config
 type ProfileHeader struct {
-	File, Network, Capabilities bool
+	File, Network, Capabilities, Privileged bool
 }
 
 // Init sets the presence of Entity headers to true by default
@@ -13,6 +13,7 @@ func (h *ProfileHeader) Init() {
 	h.File = true
 	h.Network = true
 	h.Capabilities = true
+	h.Privileged = false
 }
 
 // RuleConfig contains details for individual apparmor rules
@@ -78,7 +79,7 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   {{template "file-section" . }}
 	## == DISPATCHER START == ##
   {{- range $source, $value:= $.FromSource}}
-				{{$source}} px -> {{$.Name}}-{{$source}},
+				{{$source}} px -> {{$v := $.Name | split "."}}{{$v._0}}_{{ regexReplaceAllLiteral "[^a-z A-Z 0-9]" $source "" }},
   {{- end}}
 	{{- range $value, $data := .ProcessPaths}}
 		{{- $suffix := ""}}
@@ -120,13 +121,14 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   
 	## == POST START == ##
 	/lib/x86_64-linux-gnu/{*,**} rm,
-	
+
+	{{ if not .Privileged }}
 	deny @{PROC}/{*,**^[0-9*],sys/kernel/shm*} wkx,
 	deny @{PROC}/sysrq-trigger rwklx,
 	deny @{PROC}/mem rwklx,
 	deny @{PROC}/kmem rwklx,
 	deny @{PROC}/kcore rwklx,
-	
+
 	deny mount,
 	
 	deny /sys/[^f]*/** wklx,
@@ -136,6 +138,7 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
 	deny /sys/fs/cg[^r]*/** wklx,
 	deny /sys/firmware/efi/efivars/** rwklx,
 	deny /sys/kernel/security/** rwklx,
+	{{end}}
 
 	## == POST END == ##
 }
@@ -143,7 +146,7 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
 
 ## == FromSource per binary profiles START == ##
 {{- range $source, $value := $.FromSource}}
-profile {{$.Name}}-{{$source}} {
+profile {{$v := $.Name | split "."}}{{$v._0}}_{{ regexReplaceAllLiteral "[^a-z A-Z 0-9]" $source "" }} {
 	{{$source}} rix,
 	{{template "pre-section" $value }}
   {{template "file-section" $value}}
@@ -203,9 +206,18 @@ profile {{$.Name}}-{{$source}} {
 {{define "pre-section"}}
 	## == PRE START == ##
 	#include <abstractions/base>
-			{{ if .File}}	file,{{end}}
-			{{ if .Network}}	network,{{end}}
-			{{ if .Capabilities}}	capability,{{end}}
+	{{ if .Privileged }}
+	## == For privileged workloads == ##
+	umount,
+	mount,
+	signal,
+	unix,
+	ptrace,
+	dbus,
+	{{end}}
+	{{ if .File}}file,{{end}}
+	{{ if .Network}}network,{{end}}
+	{{ if .Capabilities}}capability,{{end}}
 	## == PRE END == ##
 {{- end}}
 
@@ -213,7 +225,11 @@ profile {{$.Name}}-{{$source}} {
   ## == Network START == ##
 	{{- range $value, $data := .NetworkRules}}
     {{- if $data.Deny}}
+	  {{- if eq $value "all" }}
+	  deny network,
+	  {{- else }}
       deny network {{$value}},
+	  {{- end}}
     {{- end}}
     {{- if $data.Allow}}
       network {{$value}},
@@ -270,28 +286,12 @@ profile {{$.Name}}-{{$source}} {
       {{- end}}
     {{- end}}
 	{{- end}}
-  ## == File/Dir END == ##
+	## == File/Dir END == ##
 {{- end}}
 
 {{ define "post-section"}}
 	## == POST START == ##
 	/lib/x86_64-linux-gnu/{*,**} rm,
-	
-	deny @{PROC}/{*,**^[0-9*],sys/kernel/shm*} wkx,
-	deny @{PROC}/sysrq-trigger rwklx,
-	deny @{PROC}/mem rwklx,
-	deny @{PROC}/kmem rwklx,
-	deny @{PROC}/kcore rwklx,
-	
-	deny mount,
-	
-	deny /sys/[^f]*/** wklx,
-	deny /sys/f[^s]*/** wklx,
-	deny /sys/fs/[^c]*/** wklx,
-	deny /sys/fs/c[^g]*/** wklx,
-	deny /sys/fs/cg[^r]*/** wklx,
-	deny /sys/firmware/efi/efivars/** rwklx,
-	deny /sys/kernel/security/** rwklx,
 
 	## == POST END == ##
 {{- end -}}

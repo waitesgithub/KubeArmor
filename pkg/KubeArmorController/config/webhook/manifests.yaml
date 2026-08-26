@@ -1,9 +1,7 @@
-
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  creationTimestamp: null
   name: mutating-webhook-configuration
 webhooks:
 - admissionReviewVersions:
@@ -25,8 +23,5 @@ webhooks:
     - UPDATE
     resources:
     - pods
+    - pods/binding
   sideEffects: NoneOnDryRun
-  objectSelector:
-    matchExpressions:
-    - key: "kubearmor-app"
-      operator: DoesNotExist

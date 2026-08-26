@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2022 Authors of KubeArmor
+// Copyright 2026 Authors of KubeArmor
 
 package syscalls
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/kubearmor/KubeArmor/protobuf"
@@ -20,18 +19,12 @@ var _ = BeforeSuite(func() {
 
 	// delete all KSPs
 	KspDeleteAll()
-
-	// enable kubearmor port forwarding
-	err = KubearmorPortForward()
-	Expect(err).To(BeNil())
-
 })
 
 var _ = AfterSuite(func() {
 	// delete wordpress-mysql app from syscalls ns
 	err := K8sDelete([]string{"manifests/ubuntu-deployment.yaml"})
 	Expect(err).To(BeNil())
-	KubearmorPortForwardStop()
 })
 
 func getUbuntuPod(name string, ant string) string {
@@ -64,17 +57,20 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-all-unlink",
+				Severity:   "3",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-all-unlink"))
-			Expect(alerts[0].Severity).To(Equal("3"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -87,20 +83,21 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"})
-			Expect(err).To(BeNil())
-
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-fromsource",
+				Severity:   "4",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-fromsource"))
-			Expect(alerts[0].Severity).To(Equal("4"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -113,23 +110,24 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "mkdir -p /foo/bar"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "mkdir -p /foo/bar"}, MatchRegexp(".*"), true)
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /foo/bar/unlink"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /foo/bar/unlink"}, MatchRegexp(".*"), true)
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "/foo/bar/unlink /dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"}, MatchRegexp(".*"), true)
+
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "/foo/bar/unlink /dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-fromsource-dir-recursive",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-fromsource-dir-recursive"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -142,20 +140,21 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /unlink"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /unlink"}, MatchRegexp(".*"), true)
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "/unlink /dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "/unlink /dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-fromsource-path",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-fromsource-path"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -171,17 +170,19 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -194,17 +195,19 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-file-path",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-file-path"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -213,24 +216,25 @@ var _ = Describe("Syscalls", func() {
 			err := K8sApply([]string{"manifests/matchpaths/unlink-dir-recursive-fromsource-path.yaml"})
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"}, MatchRegexp(".*"), true)
 
 			// Start Kubearmor Logs
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-dir-recursive-fromsource-path",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-dir-recursive-fromsource-path"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -243,17 +247,19 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-dir-recursive-fromsource-recursive-dir",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-dir-recursive-fromsource-recursive-dir"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
@@ -262,31 +268,32 @@ var _ = Describe("Syscalls", func() {
 			err := K8sApply([]string{"manifests/matchpaths/unlink-dir-recursive-fromsource-dir.yaml"})
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "cp /usr/bin/unlink /bin/unlink"}, MatchRegexp(".*"), true)
 
 			// Start Kubearmor Logs
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "/bin/unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-dir-recursive-fromsource-dir",
+				Action:     "Audit",
+				Result:     "Passed",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-dir-recursive-fromsource-dir"))
-			Expect(alerts[0].Severity).To(Equal("1"))
+			Expect(res.Found).To(BeTrue())
 
 		})
 
 	})
 
-	Describe("Policy informations for matchsyscalls", func() {
-		It("can detect unlink syscall recursive target with global informations", func() {
+	Describe("Policy information for matchsyscalls", func() {
+		It("can detect unlink syscall recursive target with global information", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchsyscalls/matchsyscalls-global-information.yaml"})
 			Expect(err).To(BeNil())
@@ -295,22 +302,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-global-information",
+				Severity:   "8",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Global message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-global-information"))
-			Expect(alerts[0].Severity).To(Equal("8"))
-			Expect(alerts[0].Tags).To(Equal("Global tag"))
-			Expect(alerts[0].Message).To(Equal("Global message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with local informations", func() {
+		It("can detect unlink syscall recursive target with local information", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchsyscalls/matchsyscalls-local-information.yaml"})
 			Expect(err).To(BeNil())
@@ -319,22 +329,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-local-information",
+				Severity:   "8",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-local-information"))
-			Expect(alerts[0].Severity).To(Equal("8"))
-			Expect(alerts[0].Tags).To(Equal("Local tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with local informations when global is set", func() {
+		It("can detect unlink syscall recursive target with local information when global is set", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchsyscalls/matchsyscalls-local-trumps-global-information.yaml"})
 			Expect(err).To(BeNil())
@@ -343,22 +356,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), true)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), true)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-local-trumps-global-information",
+				Severity:   "7",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-local-trumps-global-information"))
-			Expect(alerts[0].Severity).To(Equal("7"))
-			Expect(alerts[0].Tags).To(Equal("Local tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with missing local informations when global is set", func() {
+		It("can detect unlink syscall recursive target with missing local information when global is set", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchsyscalls/matchsyscalls-global-fill-missing-local-information.yaml"})
 			Expect(err).To(BeNil())
@@ -367,24 +383,27 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), false)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), false)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-global-fill-missing-local-information",
+				Severity:   "7",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-global-fill-missing-local-information"))
-			Expect(alerts[0].Severity).To(Equal("7"))
-			Expect(alerts[0].Tags).To(Equal("Global tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 	})
 
-	Describe("Policy informations for matchpaths", func() {
-		It("can detect unlink syscall recursive target with global informations", func() {
+	Describe("Policy information for matchpaths", func() {
+		It("can detect unlink syscall recursive target with global information", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchpaths/matchpaths-global-information.yaml"})
 			Expect(err).To(BeNil())
@@ -393,22 +412,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), false)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), false)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-global-information",
+				Severity:   "8",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Global message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-global-information"))
-			Expect(alerts[0].Severity).To(Equal("8"))
-			Expect(alerts[0].Tags).To(Equal("Global tag"))
-			Expect(alerts[0].Message).To(Equal("Global message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with local informations", func() {
+		It("can detect unlink syscall recursive target with local information", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchpaths/matchpaths-local-information.yaml"})
 			Expect(err).To(BeNil())
@@ -417,22 +439,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), false)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), false)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-local-information",
+				Severity:   "8",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-local-information"))
-			Expect(alerts[0].Severity).To(Equal("8"))
-			Expect(alerts[0].Tags).To(Equal("Local tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with local informations when global is set", func() {
+		It("can detect unlink syscall recursive target with local information when global is set", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchpaths/matchpaths-local-trumps-global-information.yaml"})
 			Expect(err).To(BeNil())
@@ -441,22 +466,25 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), false)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), false)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-local-trumps-global-information",
+				Severity:   "7",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-local-trumps-global-information"))
-			Expect(alerts[0].Severity).To(Equal("7"))
-			Expect(alerts[0].Tags).To(Equal("Local tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
-		It("can detect unlink syscall recursive target with missing local informations when global is set", func() {
+		It("can detect unlink syscall recursive target with missing local information when global is set", func() {
 			// Apply policy
 			err := K8sApply([]string{"manifests/matchpaths/matchpaths-global-fill-missing-local-information.yaml"})
 			Expect(err).To(BeNil())
@@ -465,19 +493,22 @@ var _ = Describe("Syscalls", func() {
 			err = KarmorLogStart("policy", "syscalls", "Syscall", ubuntu)
 			Expect(err).To(BeNil())
 
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"})
-			Expect(err).To(BeNil())
-			_, _, err = K8sExecInPod(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"})
-			Expect(err).To(BeNil())
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "touch /home/dummy"}, MatchRegexp(".*"), false)
+			AssertCommand(ubuntu, "syscalls", []string{"bash", "-c", "unlink /home/dummy"}, MatchRegexp(".*"), false)
 
 			// check policy alert
-			_, alerts, err := KarmorGetLogs(5*time.Second, 1)
+			expect := protobuf.Alert{
+				PolicyName: "audit-unlink-global-fill-missing-local-information",
+				Severity:   "7",
+				Action:     "Audit",
+				Result:     "Passed",
+				Message:    "Local message",
+			}
+
+			res, err := KarmorGetTargetAlert(5*time.Second, &expect)
 			Expect(err).To(BeNil())
-			Expect(len(alerts)).To(BeNumerically(">=", 1))
-			Expect(alerts[0].PolicyName).To(Equal("audit-unlink-global-fill-missing-local-information"))
-			Expect(alerts[0].Severity).To(Equal("7"))
-			Expect(alerts[0].Tags).To(Equal("Global tag"))
-			Expect(alerts[0].Message).To(Equal("Local message"))
+			Expect(res.Found).To(BeTrue())
+
 		})
 
 		It("mount will be blocked by default for a pod", func() {
@@ -488,13 +519,15 @@ var _ = Describe("Syscalls", func() {
 			Expect(err).To(BeNil())
 
 			// execute mount inside the pod
-			sout, _, err := K8sExecInPod(ubuntu, "syscalls",
-				[]string{"bash", "-c", "mkdir /mnt/test"})
-			Expect(err).To(BeNil())
-			sout, _, err = K8sExecInPod(ubuntu, "syscalls",
-				[]string{"bash", "-c", "mount /home /mnt/test"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
+			AssertCommand(
+				ubuntu, "syscalls", []string{"bash", "-c", "mkdir /mnt/test"},
+				MatchRegexp(".*"), true,
+			)
+
+			AssertCommand(
+				ubuntu, "syscalls", []string{"bash", "-c", "mount /home /mnt/test"},
+				MatchRegexp(".*"), true,
+			)
 
 			expect := protobuf.Alert{
 				PolicyName: "DefaultPosture",
@@ -517,10 +550,10 @@ var _ = Describe("Syscalls", func() {
 			Expect(err).To(BeNil())
 
 			// execute umount inside the pod
-			sout, _, err := K8sExecInPod(ubuntu, "syscalls",
-				[]string{"bash", "-c", "umount /mnt"})
-			Expect(err).To(BeNil())
-			fmt.Printf("OUTPUT: %s\n", sout)
+			AssertCommand(
+				ubuntu, "syscalls", []string{"bash", "-c", "umount /mnt"},
+				MatchRegexp(".*"), true,
+			)
 
 			expect := protobuf.Alert{
 				PolicyName: "DefaultPosture",
